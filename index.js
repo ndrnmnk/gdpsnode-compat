@@ -7,6 +7,7 @@ const { promisify } = require('node:util');
 const legacyLikes = require('./legacyLikes');
 const legacyChallenges = require('./legacyChallenges');
 const legacyGauntlets = require('./legacyGauntlets');
+const legacyUsers = require('./legacyUsers');
 const unzip = promisify(zlib.unzip);
 const gzip = promisify(zlib.gzip);
 const MAX_BYTES = 50 * 1024 * 1024;
@@ -26,6 +27,8 @@ alias('uploadGJLevel uploadGJLevel19 uploadGJLevel20', 'uploadGJLevel21');
 alias('updateGJUserScore updateGJUserScore19 updateGJUserScore20 updateGJUserScore21', 'updateGJUserScore22');
 alias('getGJComments getGJComments19 getGJComments20', 'getGJComments21');
 alias('uploadGJComment uploadGJComment19 uploadGJComment20', 'uploadGJComment21');
+alias('deleteGJComment deleteGJComment19', 'deleteGJComment20');
+alias('deleteGJLevelUser deleteGJLevelUser19', 'deleteGJLevelUser20');
 alias('getGJScores getGJScores19 getGJCreators getGJCreators19', 'getGJScores20');
 alias('getGJMapPacks getGJMapPacks20', 'getGJMapPacks21');
 alias('getGJGauntlets', 'getGJGauntlets21');
@@ -62,6 +65,7 @@ function pairs(value, delimiter, change) {
 async function responseFor(text, state) {
     if (typeof text !== 'string' || /^-\d+$/.test(text)) return text;
     const { target, gameVersion, binaryVersion } = state;
+    text = legacyUsers.rewrite(state.db, target, text);
     const sections = text.split('#');
     if (target === '/getGJRewards.php' && state.guestRewards) {
         const encoded = text.slice(5).split('|')[0];
@@ -73,8 +77,11 @@ async function responseFor(text, state) {
         const payload = encode(xor(fields.join(':'), '59182'));
         return `SaKuJ${payload}|${hash(payload + 'pC26fpYaQCtg')}`;
     }
-    if (target === '/getGJUserInfo20.php' && state.messageCount !== undefined) {
-        return pairs(text, ':', (key, value) => key === '38' ? String(state.messageCount) : value);
+    if (target === '/getGJUserInfo20.php') {
+        return pairs(text, ':', (key, value) => {
+            if (gameVersion < 22 && key === '19' && value === '2') return '0'; // Classic clients only know all/none.
+            return key === '38' && state.messageCount !== undefined ? String(state.messageCount) : value;
+        });
     }
     if (target === '/getGJLevels21.php') {
         if (sections.length === 3 && sections[0] === '') sections.splice(1, 0, '', '');
@@ -169,8 +176,18 @@ module.exports = {
             const target = aliases[original] || original;
             const legacy = gameVersion < 22 || typeof body.gjp === 'string' ||
                 typeof body.password === 'string' && /(?:login|backup|sync|register)GJAccount/.test(original);
-            if (!legacy) return next();
-            const state = { target, gameVersion, binaryVersion: Number(body.binaryVersion) || (gameVersion >= 21 ? 35 : 0) };
+            if (!legacy) {
+                if (legacyUsers.targets.has(target)) {
+                    const send = res.send;
+                    res.send = function (value) {
+                        res.send = send;
+                        try { return send.call(this, legacyUsers.rewrite(api.db, target, value)); }
+                        catch (error) { next(error); return this; }
+                    };
+                }
+                return next();
+            }
+            const state = { target, gameVersion, db: api.db, binaryVersion: Number(body.binaryVersion) || (gameVersion >= 21 ? 35 : 0) };
             // Early clients can have a populated score profile before earning any stars.
             state.includeZeroScores = target === '/getGJScores20.php' && gameVersion < 19 &&
                 (body.type == null || body.type === '' || body.type === 'top') &&
@@ -181,7 +198,7 @@ module.exports = {
                     // Signed-out clients may still send placeholder GJP fields. PHP ignores
                     // them when accountID is zero; authenticate a guest only by its device.
                     if (gameVersion < 22 && noAccount &&
-                        ['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJRewards.php'].includes(target)) {
+                        ['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/deleteGJComment20.php', '/deleteGJLevelUser20.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJRewards.php'].includes(target)) {
                         delete body.gjp;
                         delete body.gjp2;
                     }
@@ -207,9 +224,10 @@ module.exports = {
                         if (typeof body.rating !== 'string' || !/^(?:[1-9]|10)$/.test(body.rating)) return res.type('text/plain').send('-1');
                         body.stars = body.rating;
                     }
-                    if (['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJScores20.php', '/getGJRewards.php'].includes(target) && body.secret !== 'Wmfd2893gb7') {
+                    if (['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/deleteGJComment20.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJScores20.php', '/getGJRewards.php'].includes(target) && body.secret !== 'Wmfd2893gb7') {
                         return res.type('text/plain').send('-1');
                     }
+                    if (target === '/deleteGJLevelUser20.php' && body.secret !== 'Wmfv2898gc9') return res.type('text/plain').send('-1');
                     if (target === '/getGJRewards.php' && gameVersion < 22 && noAccount) {
                         const rewardType = body.rewardType == null || body.rewardType === '' ? '0' : body.rewardType;
                         if (typeof body.udid !== 'string' || !body.udid || body.udid.length > 256 ||
@@ -248,23 +266,29 @@ module.exports = {
                     // Never use a claimed userID to authenticate a registered account.
                     if (gameVersion < 22 && (!body.accountID || body.accountID === '0') && !body.gjp2 &&
                         typeof body.udid === 'string' && body.udid.length > 0 && body.udid.length <= 256 &&
-                        (['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJRewards.php'].includes(target) ||
+                        (['/updateGJUserScore22.php', '/uploadGJLevel21.php', '/uploadGJComment21.php', '/deleteGJComment20.php', '/deleteGJLevelUser20.php', '/likeGJItem211.php', '/rateGJStars211.php', '/getGJRewards.php'].includes(target) ||
                          target === '/getGJScores20.php' && ['relative', 'friends'].includes(body.type))) {
                         const deviceHash = hash(body.udid);
                         const guest = api.db.transaction(() => {
                             const mapping = api.db.prepare('SELECT accountID FROM legacy_compat_guests WHERE deviceHash = ?').get(deviceHash);
                             if (mapping) return api.db.prepare('SELECT * FROM accounts WHERE accountID = ?').get(mapping.accountID);
+                            if (target === '/deleteGJComment20.php' || target === '/deleteGJLevelUser20.php') return null;
                             const name = `_legacy_${crypto.randomBytes(12).toString('hex')}`;
                             const gjp2 = crypto.randomBytes(20).toString('hex');
                             const maximum = api.db.prepare('SELECT COALESCE(MAX(accountID), 71) AS maximum FROM accounts').get().maximum;
                             const id = Math.max(73, maximum + 1);
                             api.db.prepare('INSERT INTO accounts (accountID, userName, gjp2, isDisabled) VALUES (?, ?, ?, 0)').run(id, name, gjp2);
-                            const displayName = api.utils.charclean(String(body.userName || 'Player')).slice(0, 20) || 'Player';
+                            const displayName = api.utils.remove(String(body.userName || 'Player')).slice(0, 20) || 'Player';
                             api.db.prepare('INSERT INTO profiles (accountID, userName) VALUES (?, ?)').run(id, displayName);
                             api.db.prepare('INSERT INTO legacy_compat_guests (deviceHash, accountID) VALUES (?, ?)').run(deviceHash, id);
                             return { accountID: id, userName: name, gjp2, isDisabled: 0 };
                         })();
                         if (!guest || guest.isDisabled) return res.type('text/plain').send('-1');
+                        if (target === '/uploadGJComment21.php') state.guestCommentName = body.userName;
+                        if (typeof body.userName === 'string' && body.userName.trim()) {
+                            const displayName = api.utils.remove(body.userName).slice(0, 20);
+                            if (displayName) api.db.prepare('UPDATE profiles SET userName = ? WHERE accountID = ?').run(displayName, guest.accountID);
+                        }
                         if (target === '/getGJRewards.php') state.guestRewards = { userID: guest.accountID + 1 };
                         body.accountID = String(guest.accountID);
                         body.gjp2 = guest.gjp2;
@@ -275,6 +299,11 @@ module.exports = {
                         if (account) body.accountID = String(account.accountID);
                     }
                     if (target === '/accounts/registerGJAccount.php' && !body.rsession) body.rsession = 'legacy';
+                    // Classic frS=0 means allow all requests, including text. Core added
+                    // a no-text setting at 0 and moved the old behavior to 2. Translate
+                    // explicit settings updates only; do not change stored recipient policy.
+                    if (target === '/updateGJAccSettings20.php' && gameVersion < 22 && body.frS === '0') body.frS = '2';
+                    if (target === '/deleteGJAccComment20.php' && !body.targetAccountID) body.targetAccountID = body.accountID;
                     if (target === '/getGJUserInfo20.php' && body.accountID && body.accountID === body.targetAccountID && body.gjp2) {
                         const account = api.db.prepare('SELECT gjp2, isDisabled FROM accounts WHERE accountID = ?').get(body.accountID);
                         if (account && account.gjp2 === body.gjp2 && !account.isDisabled) {
@@ -317,11 +346,14 @@ module.exports = {
                         const seed = body.levelString.length < 50 ? body.levelString : hash(Array.from({ length: 50 }, (_, i) => body.levelString[i * step]).join('') + 'xI25fpAapCQg');
                         body.seed2 = body.levelString.length < 50 ? seed : xor(seed, '41274').toString('base64');
                     }
-                    if (target === '/uploadGJComment21.php' && gameVersion < 21) {
+                    if (target === '/uploadGJComment21.php' && (gameVersion < 21 || state.guestCommentName !== undefined)) {
                         if (gameVersion < 20) body.comment = encode(String(body.comment || ''));
                         body.percent ??= '0';
-                        body.cType = '0';
-                        body.chk = encode(xor(hash(`${body.userName}${body.comment}${body.levelID}${body.percent}0xPT6iUrtws0J`), '29481'));
+                        if (gameVersion < 21) body.cType = '0';
+                        const cType = Number(body.cType || 0);
+                        const checksum = name => encode(xor(hash(`${name}${body.comment}${Number(body.levelID)}${Number(body.percent)}${cType}xPT6iUrtws0J`), '29481'));
+                        if (gameVersion >= 21 && body.chk !== checksum(state.guestCommentName)) return res.type('text/plain').send('-1');
+                        body.chk = checksum(body.userName);
                     }
                     // Rewrite internally: POST bodies/credentials never enter a redirect URL.
                     if (target !== original) req.url = target + req.url.slice(original.length);

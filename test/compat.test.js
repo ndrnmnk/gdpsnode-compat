@@ -99,9 +99,10 @@ hooks.registerPlugin(require('..'), { db, utils, config: {} });
 const endpoints = [
     'levels/getGJLevels21', 'levels/downloadGJLevel22', 'levels/uploadGJLevel21',
     'scores/updateGJUserScore22', 'scores/getGJScores20', 'misc/likeGJItem211', 'levels/rateGJStars211',
-    'comments/getGJComments21', 'comments/uploadGJComment21',
-    'accounts/loginGJAccount', 'accounts/registerGJAccount', 'accounts/syncGJAccountNew', 'accounts/backupGJAccountNew',
-    'levels/getGJMapPacks21', 'levels/getGJGauntlets21', 'levels/getGJChallenges', 'users/getGJUserInfo20',
+    'comments/getGJComments21', 'comments/uploadGJComment21', 'comments/deleteGJComment20', 'comments/deleteGJAccComment20',
+    'accounts/loginGJAccount', 'accounts/registerGJAccount', 'accounts/syncGJAccountNew', 'accounts/backupGJAccountNew', 'accounts/updateGJAccSettings20',
+    'social/uploadFriendRequest20', 'social/getGJFriendRequests20',
+    'levels/getGJMapPacks21', 'levels/getGJGauntlets21', 'levels/getGJChallenges', 'levels/deleteGJLevelUser20', 'users/getGJUserInfo20', 'users/getGJUsers20',
     'messages/getGJMessages20', 'messages/downloadGJMessage20', 'rewards/getGJRewards'
 ];
 for (const name of endpoints) {
@@ -724,6 +725,182 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         db.prepare('UPDATE accounts SET isDisabled = 1 WHERE accountID = ?').run(guest.accountID);
         assert.equal(await post('/getGJRewards.php', rewardRequest), '-1');
         db.prepare('UPDATE accounts SET isDisabled = 0 WHERE accountID = ?').run(guest.accountID);
+    });
+    const namedGuest = { udid: 'named-guest-device', accountID: '0', userName: 'Green_Name', gameVersion: '20', binaryVersion: '29' };
+    let namedLevelID;
+    let namedCommentID;
+    let namedGuestID;
+    await t.test('guest display names remain public while internal credentials and registered identities stay separate', async () => {
+        namedGuestID = await post('/updateGJUserScore20.php', { ...namedGuest, stars: '15' });
+        namedLevelID = await post('/uploadGJLevel21.php', { ...namedGuest, levelID: '0', levelName: 'Named Guest Level', levelString: enc(zlib.gzipSync(rawLevel)) });
+        assert.match(namedLevelID, /^\d+$/);
+        namedCommentID = await post('/uploadGJComment20.php', { ...namedGuest, levelID: namedLevelID, comment: enc('Guest comment') });
+        assert.match(namedCommentID, /^\d+$/);
+        for (const version of ['19', '20', '21', '22']) {
+            const binaryVersion = version === '19' ? '0' : version === '20' ? '29' : version === '21' ? '34' : '47';
+            if (version !== '19') {
+                const levels = await post('/getGJLevels21.php', { gameVersion: version, binaryVersion, str: namedLevelID });
+                assert.ok(levels.split('#')[1].includes(`${namedGuestID}:Green_Name:0`));
+                assert.ok(!levels.includes('_legacy_'));
+            }
+            const comments = await post('/getGJComments21.php', { gameVersion: version, binaryVersion, levelID: namedLevelID });
+            if (version === '19' || version === '20') assert.equal(comments.split('#')[1], `${namedGuestID}:Green_Name:0`);
+            else {
+                const profile = fields(comments.split('#')[0].split(':')[1], '~');
+                assert.equal(profile['1'], 'Green_Name');
+                assert.equal(profile['16'], '0');
+            }
+        }
+        const publicProfile = fields((await post('/getGJUsers20.php', { gameVersion: '22', str: namedGuestID })).split('#')[0]);
+        assert.equal(publicProfile['1'], 'Green_Name');
+        assert.equal(publicProfile['2'], namedGuestID);
+        assert.equal(publicProfile['16'], '0');
+        const scores = await post('/getGJScores20.php', { gameVersion: '22', type: 'top' });
+        const guestScore = scores.split('|').map(row => fields(row)).find(row => row['2'] === namedGuestID);
+        assert.equal(guestScore['16'], '0');
+        assert.equal(guestScore['7'], '0');
+        const stored = db.prepare('SELECT userName FROM accounts WHERE accountID = ?').get(Number(namedGuestID) - 1);
+        assert.match(stored.userName, /^_legacy_/);
+        assert.equal(db.prepare('SELECT userName FROM accounts WHERE accountID = 72').get().userName, 'Alice');
+    });
+    await t.test('later guest names update existing authors and valid 2.1 guest comment checksums still work', async () => {
+        await post('/updateGJUserScore20.php', { ...namedGuest, userName: 'Renamed_Guest' });
+        const comment = enc('Twenty one guest');
+        const chk = enc(xor(crypto.createHash('sha1').update(`Renamed_Guest${comment}${namedLevelID}00xPT6iUrtws0J`).digest('hex'), '29481'));
+        const id = await post('/uploadGJComment21.php', { ...namedGuest, userName: 'Renamed_Guest', binaryVersion: '34', gjp: '0', levelID: namedLevelID, comment, percent: '0', chk });
+        assert.match(id, /^\d+$/);
+        assert.equal(await post('/uploadGJComment21.php', { ...namedGuest, userName: 'Renamed_Guest', binaryVersion: '34', levelID: namedLevelID, comment, chk: 'bad' }), '-1');
+        const shown = await post('/getGJComments21.php', { gameVersion: '22', levelID: namedLevelID });
+        for (const row of shown.split('#')[0].split('|')) {
+            const profile = fields(row.split(':')[1], '~');
+            assert.equal(profile['1'], 'Renamed_Guest');
+            assert.equal(profile['16'], '0');
+        }
+        db.prepare('UPDATE levels SET dailyNumber = 90000, dailyTime = ? WHERE levelID = ?').run(Math.floor(Date.now() / 1000) + 3600, namedLevelID);
+        const daily = await post('/downloadGJLevel22.php', { gameVersion: '22', levelID: '-1' });
+        assert.equal(daily.split('#')[3], `${namedGuestID}:Renamed_Guest:0`);
+        db.prepare('UPDATE levels SET dailyNumber = 0, dailyTime = 0 WHERE levelID = ?').run(namedLevelID);
+    });
+    await t.test('captured anonymous comment deletion resolves the author UDID and enforces ownership', async () => {
+        const request = { udid: namedGuest.udid, accountID: '0', commentID: namedCommentID, levelID: namedLevelID, secret: 'Wmfd2893gb7' };
+        assert.equal(await post('//deleteGJComment19.php', { ...request, udid: 'anonymous-21-uploader' }), '-1');
+        assert.ok(db.prepare('SELECT commentID FROM comments WHERE commentID = ?').get(namedCommentID));
+        assert.equal(await post('//deleteGJComment19.php', { ...request, secret: 'bad' }), '-1');
+        assert.equal(await post('//deleteGJComment19.php', request), '1');
+        assert.equal(db.prepare('SELECT commentID FROM comments WHERE commentID = ?').get(namedCommentID), undefined);
+        for (const [version, binaryVersion] of [['20', '29'], ['20', '34']]) {
+            const info = db.prepare("INSERT INTO comments (accountID, userName, comment, levelID, timestamp) VALUES (?, 'Guest', ?, ?, 0)")
+                .run(Number(namedGuestID) - 1, enc('Delete again'), namedLevelID);
+            assert.equal(await post('/deleteGJComment20.php', { ...request, gameVersion: version, binaryVersion, commentID: String(info.lastInsertRowid) }), '1');
+        }
+        const before = db.prepare('SELECT COUNT(*) AS count FROM legacy_compat_guests').get().count;
+        assert.equal(await post('/deleteGJComment19.php', { ...request, udid: 'unseen-delete-device' }), '-1');
+        assert.equal(db.prepare('SELECT COUNT(*) AS count FROM legacy_compat_guests').get().count, before);
+    });
+    await t.test('captured anonymous level deletion works across 1.9/2.0/2.1 with the level secret and native cleanup', async () => {
+        for (const [route, version, binaryVersion] of [['deleteGJLevelUser19', '19', '0'], ['deleteGJLevelUser20', '20', '29'], ['deleteGJLevelUser20', '20', '34']]) {
+            const id = await post('/uploadGJLevel21.php', { ...namedGuest, gameVersion: version, binaryVersion, levelName: `Delete ${version} ${binaryVersion}`, levelString: enc(zlib.gzipSync(rawLevel)) });
+            assert.match(id, /^\d+$/);
+            const request = { udid: namedGuest.udid, accountID: '0', levelID: id, secret: 'Wmfv2898gc9', gameVersion: version, binaryVersion };
+            assert.equal(await post(`//${route}.php`, { ...request, udid: 'anonymous-21-uploader' }), '-1');
+            assert.equal(await post(`//${route}.php`, { ...request, secret: 'Wmfd2893gb7' }), '-1');
+            db.prepare('UPDATE levels SET starStars = 2 WHERE levelID = ?').run(id);
+            assert.equal(await post(`//${route}.php`, request), '-1');
+            db.prepare('UPDATE levels SET starStars = 0 WHERE levelID = ?').run(id);
+            db.prepare("INSERT INTO comments (accountID, userName, comment, levelID, timestamp) VALUES (73, 'Bob', ?, ?, 0)").run(enc('Cleanup'), id);
+            assert.equal(await post(`//${route}.php`, request), '1');
+            assert.equal(db.prepare('SELECT levelID FROM levels WHERE levelID = ?').get(id), undefined);
+            assert.equal(db.prepare('SELECT commentID FROM comments WHERE levelID = ?').get(id), undefined);
+            assert.equal(fs.existsSync(path.join(temporary, `${id}.gdcs`)), false);
+        }
+    });
+    await t.test('captured account-comment deletion infers the omitted target and keeps native account checks', async () => {
+        for (const binaryVersion of ['29', '34']) {
+            const info = db.prepare("INSERT INTO acccomments (accountID, userName, comment, timestamp) VALUES (72, 'Alice', ?, 0)").run(enc('Account comment'));
+            const request = { gameVersion: '20', binaryVersion, accountID: '72', gjp, commentID: String(info.lastInsertRowid), secret: 'Wmfd2893gb7', cType: '1' };
+            assert.equal(await post('//deleteGJAccComment20.php', { ...request, gjp: enc(xor('wrong', '37526')) }), '-1');
+            assert.equal(await post('//deleteGJAccComment20.php', { ...request, accountID: '73' }), '-1');
+            assert.ok(db.prepare('SELECT commentID FROM acccomments WHERE commentID = ?').get(request.commentID));
+            assert.equal(await post('//deleteGJAccComment20.php', request), '1');
+            assert.equal(db.prepare('SELECT commentID FROM acccomments WHERE commentID = ?').get(request.commentID), undefined);
+        }
+    });
+    await t.test('captured 2.0 friend request text is valid and works when recipient allows text', async () => {
+        const captured = { gameVersion: '20', binaryVersion: '29', accountID: '72', gjp, toAccountID: '73', comment: 'Pw==', secret: 'Wmfd2893gb7' };
+        db.prepare('DELETE FROM friendreqs WHERE accountID = 72 AND toAccountID = 73').run();
+        db.prepare('UPDATE profiles SET frS = 0 WHERE accountID = 73').run();
+        assert.equal(await post('//uploadFriendRequest20.php', captured), '-1');
+        assert.equal(await post('//uploadFriendRequest20.php', { ...captured, comment: '' }), '1');
+        db.prepare('DELETE FROM friendreqs WHERE accountID = 72 AND toAccountID = 73').run();
+        // A recipient changing the classic "all" setting explicitly opts in to text.
+        const settings = { gameVersion: '20', binaryVersion: '29', accountID: '73', gjp, frS: '0', secret: 'Wmfv3899gc9' };
+        assert.equal(await post('/updateGJAccSettings20.php', { ...settings, gjp: enc(xor('wrong', '37526')) }), '-1');
+        assert.equal(db.prepare('SELECT frS FROM profiles WHERE accountID = 73').get().frS, 0);
+        assert.equal(await post('/updateGJAccSettings20.php', settings), '1');
+        assert.equal(db.prepare('SELECT frS FROM profiles WHERE accountID = 73').get().frS, 2);
+        const legacyProfile = fields(await post('/getGJUserInfo20.php', { gameVersion: '20', binaryVersion: '29', targetAccountID: '73' }));
+        assert.equal(legacyProfile['19'], '0');
+        const currentProfile = fields(await post('/getGJUserInfo20.php', { gameVersion: '22', targetAccountID: '73' }));
+        assert.equal(currentProfile['19'], '2');
+        const currentGJPProfile = fields(await post('/getGJUserInfo20.php', { gameVersion: '22', accountID: '72', gjp, targetAccountID: '73' }));
+        assert.equal(currentGJPProfile['19'], '2');
+        assert.equal(await post('//uploadFriendRequest20.php', captured), '1');
+        assert.equal(db.prepare('SELECT comment FROM friendreqs WHERE accountID = 72 AND toAccountID = 73').get().comment, 'Pw==');
+        const inbox = await post('/getGJFriendRequests20.php', { gameVersion: '20', binaryVersion: '29', accountID: '73', gjp, page: '0' });
+        assert.equal(fields(inbox.split('#')[0])['35'], 'Pw==');
+        // Modern no-text settings retain their original meaning.
+        assert.equal(await post('/updateGJAccSettings20.php', { ...settings, gameVersion: '22', gjp: undefined, gjp2 }), '1');
+        assert.equal(db.prepare('SELECT frS FROM profiles WHERE accountID = 73').get().frS, 0);
+    });
+    await t.test('captured 2.0 legacy message works for friends and respects recipient message settings', async () => {
+        const captured = { gameVersion: '20', binaryVersion: '29', accountID: '72', gjp, toAccountID: '73', subject: 'UmU6IGhleQ==', body: 'WVFL', secret: 'Wmfd2893gb7' };
+        db.prepare('UPDATE profiles SET mS = 1 WHERE accountID = 73').run();
+        assert.equal(await post('//uploadGJMessage20.php', captured), '-1');
+        const friendship = db.prepare('INSERT INTO friendships (person1, person2, isNew1, isNew2) VALUES (72, 73, 0, 0)').run();
+        assert.equal(await post('//uploadGJMessage20.php', captured), '1');
+        const message = db.prepare('SELECT ID, subject, body FROM messages WHERE accID = 72 AND toAccountID = 73 ORDER BY ID DESC LIMIT 1').get();
+        assert.equal(message.subject, captured.subject);
+        assert.equal(message.body, captured.body);
+        const received = await post('/downloadGJMessage20.php', { gameVersion: '20', binaryVersion: '29', accountID: '73', gjp, messageID: String(message.ID) });
+        assert.equal(fields(received)['4'], captured.subject);
+        assert.equal(fields(received)['5'], captured.body);
+        db.prepare('UPDATE profiles SET mS = 2 WHERE accountID = 73').run();
+        assert.equal(await post('//uploadGJMessage20.php', captured), '-1');
+        db.prepare('DELETE FROM friendships WHERE ID = ?').run(friendship.lastInsertRowid);
+        db.prepare('UPDATE profiles SET mS = 0 WHERE accountID = 73').run();
+        assert.equal(await post('//uploadGJMessage20.php', captured), '1');
+        const block = db.prepare('INSERT INTO blocks (person1, person2) VALUES (73, 72)').run();
+        assert.equal(await post('//uploadGJMessage20.php', captured), '-1');
+        db.prepare('DELETE FROM blocks WHERE ID = ?').run(block.lastInsertRowid);
+    });
+    await t.test('paired 2.0 and 2.2 friend requests depend on recipient policy and reverse pending requests, not sender mS', async () => {
+        const clear = () => db.prepare(`DELETE FROM friendreqs WHERE
+            (accountID = 72 AND toAccountID = 73) OR (accountID = 73 AND toAccountID = 72)`).run();
+        clear();
+        db.prepare('UPDATE profiles SET frS = 2 WHERE accountID IN (72, 73)').run();
+        // Captured payloads send in opposite directions; use fixture credentials/account IDs.
+        const oldClient = { gameVersion: '20', binaryVersion: '29', accountID: '72', gjp, toAccountID: '73', comment: 'aGk=', secret: 'Wmfd2893gb7' };
+        const currentClient = { gameVersion: '22', binaryVersion: '45', udid: 'current-client-device', uuid: '74', accountID: '73', gjp2,
+            toAccountID: '72', comment: 'aGk=', secret: 'Wmfd2893gb7' };
+        for (const mS of [0, 1]) {
+            db.prepare('UPDATE profiles SET mS = ? WHERE accountID = 72').run(mS);
+            assert.equal(await post('//uploadFriendRequest20.php', oldClient), '1');
+            assert.equal(db.prepare('SELECT comment FROM friendreqs WHERE accountID = 72 AND toAccountID = 73').get().comment, 'aGk=');
+            clear();
+        }
+        assert.equal(await post('/uploadFriendRequest20.php', currentClient), '1');
+        assert.equal(await post('//uploadFriendRequest20.php', oldClient), '-1');
+        const incoming = fields(await post('/getGJUserInfo20.php', { ...oldClient, targetAccountID: '73' }));
+        assert.equal(incoming['31'], '3');
+        assert.equal(incoming['35'], 'aGk=');
+        clear();
+        assert.equal(await post('//uploadFriendRequest20.php', oldClient), '1');
+        assert.equal(await post('/uploadFriendRequest20.php', currentClient), '-1');
+        clear();
+        db.prepare('UPDATE profiles SET frS = 0 WHERE accountID = 73').run();
+        assert.equal(await post('//uploadFriendRequest20.php', oldClient), '-1');
+        assert.equal(await post('/uploadFriendRequest20.php', currentClient), '1');
+        clear();
     });
     await t.test('guests never consume the first registered administrator account', async () => {
         db.exec('DELETE FROM legacy_compat_guests; DELETE FROM accounts; DELETE FROM profiles;');
