@@ -78,8 +78,7 @@ Module._load = function (request, parent, ...args) {
     return load.call(this, request, parent, ...args);
 };
 const utils = require(path.join(root, 'utils'));
-const httpsGuardEnabled = fs.readFileSync(path.join(root, 'plugins/legacy-compat/index.js'), 'utf8')
-    .split('\n').some(line => line.trim() === "Object.hasOwn(body, 'password') && req.secure !== true) {");
+const httpsGuardEnabled = !require('../config.js').allow_insecure_login;
 const { HookRegistry } = require(path.join(root, 'hooks'));
 const layers = [];
 const app = {
@@ -103,12 +102,13 @@ const endpoints = [
     'accounts/loginGJAccount', 'accounts/registerGJAccount', 'accounts/syncGJAccountNew', 'accounts/backupGJAccountNew', 'accounts/updateGJAccSettings20',
     'social/uploadFriendRequest20', 'social/getGJFriendRequests20',
     'levels/getGJMapPacks21', 'levels/getGJGauntlets21', 'levels/getGJChallenges', 'levels/deleteGJLevelUser20', 'users/getGJUserInfo20', 'users/getGJUsers20',
-    'messages/getGJMessages20', 'messages/downloadGJMessage20', 'rewards/getGJRewards'
+    'threads/updateGJThread', 'misc/reportGJContent', 'threads/getGJThreads', 'threads/getGJThreadMessages', 'threads/sendGJThreadMessage', 'messages/getGJMessages20', 'messages/downloadGJMessage20', 'rewards/getGJRewards'
 ];
 for (const name of endpoints) {
     const endpoint = require(path.join(root, 'endpoints', name));
     app.post(endpoint.path, ...(endpoint.middleware || []), endpoint.handler);
 }
+const newsContent = require(path.join(root, 'newsContent'));
 Module._load = load;
 
 function post(url, body, inspect, ip = '127.0.0.1', transport = {}) {
@@ -179,6 +179,7 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         assert.equal(await post('/accounts/registerGJAccount.php', registration, undefined, undefined, { secure: true }), '1');
         const account = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('TLSUser');
         assert.ok(account);
+        db.prepare('DELETE FROM messages WHERE toAccountID = ? OR accID = ?').run(account.accountID, account.accountID);
         db.prepare('DELETE FROM profiles WHERE accountID = ?').run(account.accountID);
         db.prepare('DELETE FROM accounts WHERE accountID = ?').run(account.accountID);
         assert.equal(db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BlockedUser'), undefined);
@@ -329,6 +330,8 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
     await t.test('legacy inbox: upload, list without marking read, download marks read, privacy and deletion', async () => {
         const messageBody = { ...auth, toAccountID: '73', subject: enc('Hello'), body: enc(xor('Message body', '14251')) };
         assert.equal(await post('/uploadGJMessage20.php', messageBody), '1');
+        const notice = db.prepare('SELECT * FROM notifications WHERE toAccountID = 73 ORDER BY notificationID DESC').get();
+        assert.equal(Buffer.from(notice.title, 'base64').toString(), 'New legacy message');
         const id = db.prepare('SELECT ID FROM messages').get().ID;
         const recipient = { ...auth, accountID: '73', page: '0' };
         assert.match(await post('/getGJMessages20.php', recipient), /4:SGVsbG8=/);
@@ -602,64 +605,6 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         assert.equal(await post('/getGJLevels21.php', request), '-1');
         db.prepare('UPDATE gauntlets SET level5 = 203 WHERE ID = 1').run();
     });
-    const questRequest = { gameVersion: '20', binaryVersion: '34', gdw: '0', accountID: '72', gjp,
-        udid: 'ffffffff-bc90-02e8-0033-c5870033c587', uuid: '73', world: '0', secret: 'Wmfd2893gb7', chk: 'RL84HAAwBAQIF' };
-    function questFields(wire) {
-        assert.ok(wire.startsWith('SaKuJ'));
-        const [encoded, hash] = wire.slice(5).split('|');
-        assert.equal(hash, crypto.createHash('sha1').update(encoded + 'oC36fpYaPtdg').digest('hex'));
-        return utils.xorCipher(Buffer.from(encoded, 'base64'), '19847').toString().split(':');
-    }
-    await t.test('captured quest request returns a valid legacy response even with no configured quests', async () => {
-        assert.equal(db.prepare('SELECT COUNT(*) AS count FROM quests').get().count, 0);
-        const nonce = utils.xorCipher(Buffer.from(questRequest.chk.slice(5), 'base64'), '19847').toString();
-        const requests = [questRequest, { ...questRequest, accountID: '0', gjp: '0', uuid: '0', udid: 'test-device' }];
-        for (const request of requests) {
-            const parts = questFields(await post('//getGJChallenges.php', request));
-            assert.equal(parts.length, 9);
-            assert.equal(parts[0], 'SaKuJ');
-            assert.equal(parts[2], nonce);
-            assert.equal(parts[3], request.udid);
-            assert.equal(parts[4], request.accountID);
-            if (request.accountID === '72') assert.equal(parts[1], '73');
-            assert.ok(Number(parts[5]) > 0 && Number(parts[5]) <= 86400);
-            const records = parts.slice(6).map(quest => quest.split(','));
-            assert.deepEqual(records.map(row => Number(row[1])).sort(), [1, 2, 3]);
-            assert.deepEqual(records.map(row => Number(row[0])), [Number(records[0][0]), Number(records[0][0]) + 1, Number(records[0][0]) + 2]);
-            assert.ok(records.every(row => row.length === 5 && Number(row[2]) > 0 && Number(row[3]) > 0 && row[4]));
-            const again = questFields(await post('/getGJChallenges.php', request));
-            assert.deepEqual(again.slice(6), parts.slice(6));
-        }
-        assert.equal(db.prepare('SELECT COUNT(*) AS count FROM quests').get().count, 0);
-        // The plugin's fallback does not replace the current handler for 2.2 clients.
-        assert.equal(await post('/getGJChallenges.php', { gameVersion: '22', accountID: '72', gjp2, uuid: '73', udid: questRequest.udid, chk: questRequest.chk }), '-1');
-    });
-    await t.test('quests use configured records, fill incomplete configuration and share UTC expiration with IDs', async () => {
-        for (const [type, name] of [[1, 'Custom Orbs'], [2, 'Custom Coins'], [3, 'Custom Stars']]) {
-            db.prepare('INSERT INTO quests (type, amount, reward, name) VALUES (?, 12, 7, ?)').run(type, name);
-        }
-        const parts = questFields(await post('/getGJChallenges.php', questRequest));
-        assert.deepEqual(parts.slice(6).map(q => q.split(',')[4]).sort(), ['Custom Coins', 'Custom Orbs', 'Custom Stars']);
-        const legacyChallenges = require('../legacyChallenges');
-        const before = questFields(legacyChallenges.response(db, { ...questRequest, gjp2 }, Date.UTC(2026, 10, 1, 23, 59, 59)));
-        const after = questFields(legacyChallenges.response(db, { ...questRequest, gjp2 }, Date.UTC(2026, 10, 2)));
-        assert.equal(before[5], '1');
-        assert.equal(after[5], '86400');
-        assert.equal(Number(after[6].split(',')[0]) - Number(before[6].split(',')[0]), 3);
-        db.prepare('DELETE FROM quests WHERE type != 1').run();
-        const mixed = questFields(await post('/getGJChallenges.php', questRequest));
-        assert.equal(mixed.slice(6).length, 3);
-        assert.ok(mixed.slice(6).some(q => q.endsWith(',Custom Orbs')));
-    });
-    await t.test('legacy quests reject incorrect credentials, secrets, identities and challenge tokens', async () => {
-        assert.equal(await post('/getGJChallenges.php', { ...questRequest, gjp: enc(xor('wrong', '37526')) }), '-1');
-        assert.equal(await post('/getGJChallenges.php', { ...questRequest, secret: 'bad' }), '-1');
-        assert.equal(await post('/getGJChallenges.php', { ...questRequest, udid: '123' }), '-1');
-        for (const chk of ['', '12345', 'ABCDE!!!!']) assert.equal(await post('/getGJChallenges.php', { ...questRequest, chk }), '-1');
-        db.prepare('UPDATE accounts SET isDisabled = 1 WHERE accountID = 72').run();
-        assert.equal(await post('/getGJChallenges.php', questRequest), '-1');
-        db.prepare('UPDATE accounts SET isDisabled = 0 WHERE accountID = 72').run();
-    });
     const rewardRequest = { gameVersion: '20', binaryVersion: '34', gdw: '0', accountID: '0', gjp: '',
         udid: 'ffffffff-bc90-02e8-0033-c5870033c587', uuid: '1', rewardType: '0', secret: 'Wmfd2893gb7', chk: 'ia5P8AwgACQA=' };
     function rewardFields(wire, prefix = 'SaKuJ') {
@@ -901,6 +846,231 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         assert.equal(await post('//uploadFriendRequest20.php', oldClient), '-1');
         assert.equal(await post('/uploadFriendRequest20.php', currentClient), '1');
         clear();
+    });
+    await t.test('message bridge welcomes accounts, authenticates commands and forwards only opted-in DMs', async () => {
+        assert.equal(await post('/accounts/registerGJAccount.php', { userName: 'BridgeUser', password, rsession: 'test', secret: 'Wmfv3899gc9', gameVersion: '22' }, undefined, undefined, { secure: true }), '1');
+        const id = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BridgeUser').accountID;
+        const greeting = db.prepare('SELECT * FROM messages WHERE toAccountID = ? AND accID = 71 ORDER BY ID').all(id);
+        const greetingText = greeting.map(message => xor(Buffer.from(message.body, 'base64').toString(), '14251').toString()).join('');
+        assert.match(greetingText, /message_bridge 1/);
+        assert.match(greetingText, /subscribe_news/);
+        const clientAuth = { accountID: String(id), gjp2, gameVersion: '22' };
+        const rows = (await post('/getGJThreads.php', clientAuth)).split('#')[0].split('|').map(row => row.split(':'));
+        const system = rows.find(row => row[1] === '71');
+        assert.ok(system);
+        assert.equal(system[25], '0');
+        const metadata = (await post('/getGJThreadMessages.php', { ...clientAuth, threadID: system[0] })).split('#')[4].split(':');
+        assert.equal(metadata[10], '0');
+        assert.match(await post('/sendGJThreadMessage.php', { ...clientAuth, threadID: system[0], body: enc('legacy_notif 1') }), /^\d+:\d+$/);
+        const legacyAuth = { ...auth, accountID: String(id), toAccountID: '71', subject: enc('Bridge'), body: enc(xor('message_bridge 1', '14251')) };
+        assert.equal(await post('/uploadGJMessage20.php', { ...legacyAuth, gjp: enc(xor('wrong', '37526')) }), '-1');
+        assert.equal(await post('/uploadGJMessage20.php', legacyAuth), '1');
+        const thread = db.prepare('INSERT INTO threads (isDM, ownerID, createdAt, updatedAt) VALUES (1, 72, 1, 1)').run().lastInsertRowid;
+        db.prepare('INSERT INTO thread_members (threadID, accountID, status) VALUES (?, 72, 1), (?, ?, 1)').run(thread, thread, id);
+        const sent = await post('/sendGJThreadMessage.php', { accountID: '72', gjp2, gameVersion: '22', threadID: String(thread), body: enc('Hello from a new DM') });
+        assert.match(sent, /^\d+:\d+$/);
+        const forwarded = db.prepare('SELECT * FROM messages WHERE accID = 72 AND toAccountID = ? ORDER BY ID DESC').get(id);
+        assert.equal(xor(Buffer.from(forwarded.body, 'base64').toString(), '14251').toString(), 'Hello from a new DM');
+        assert.equal(await post('/uploadGJMessage20.php', { ...legacyAuth, body: enc(xor('message_bridge 0', '14251')) }), '1');
+        assert.match(await post('/sendGJThreadMessage.php', { accountID: String(id), gjp2, isDM: '1', toAccountID: '71', body: enc('message_bridge 0') }), /^\d+:\d+$/);
+        const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE accID = 72 AND toAccountID = ?').get(id).n;
+        await post('/sendGJThreadMessage.php', { accountID: '72', gjp2, gameVersion: '22', threadID: String(thread), body: enc('No forwarding') });
+        assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE accID = 72 AND toAccountID = ?').get(id).n, count);
+    });
+    await t.test('legacy replies reuse DMs without echoes and notification preferences persist', async () => {
+        const recipient = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BridgeUser').accountID;
+        const modernAuth = { accountID: String(recipient), gjp2, gameVersion: '22', isDM: '1', toAccountID: '71' };
+        assert.match(await post('/sendGJThreadMessage.php', { ...modernAuth, body: enc('message_bridge 1') }), /^\d+:\d+$/);
+        const existing = db.prepare(`SELECT t.threadID FROM threads t JOIN thread_members m ON m.threadID = t.threadID
+            WHERE t.ownerID = 72 AND t.isDM = 1 AND m.accountID = ?`).get(recipient).threadID;
+        const request = { ...auth, toAccountID: String(recipient), subject: enc('A legacy reply'), body: enc(xor('Reply body', '14251')) };
+        const countLegacy = () => db.prepare('SELECT COUNT(*) AS n FROM messages WHERE accID = 72 AND toAccountID = ?').get(recipient).n;
+        const countNotices = () => db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE toAccountID = ?').get(recipient).n;
+        assert.equal(await post('/uploadGJMessage20.php', request), '-1'); // Friends-only by default.
+        db.prepare('UPDATE profiles SET mS = 0 WHERE accountID = ?').run(recipient);
+        const before = countLegacy();
+        const notices = countNotices();
+        assert.equal(await post('/uploadGJMessage20.php', request), '1');
+        assert.equal(countLegacy(), before + 1);
+        assert.equal(countNotices(), notices + 1);
+        const translated = db.prepare('SELECT * FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(existing);
+        assert.equal(translated.accountID, 72);
+        assert.equal(Buffer.from(translated.content, 'base64').toString(), 'A legacy reply\n\nReply body');
+        assert.equal(await post('/sendGJThreadMessage.php', { ...modernAuth, gjp2: 'x'.repeat(40), body: enc('legacy_notif 0') }), '-1');
+        assert.match(await post('/sendGJThreadMessage.php', { ...modernAuth, body: enc('legacy_notif 0') }), /^\d+:\d+$/);
+        assert.equal(db.prepare('SELECT enabled FROM legacy_compat_notifications WHERE accountID = ?').get(recipient).enabled, 0);
+        assert.equal(await post('/uploadGJMessage20.php', request), '1');
+        assert.equal(countNotices(), notices + 1);
+        assert.equal(countLegacy(), before + 2);
+        assert.equal(await post('/uploadGJMessage20.php', { ...auth, accountID: String(recipient), toAccountID: '71', subject: enc('Settings'), body: enc(xor('legacy_notif 1', '14251')) }), '1');
+        assert.equal(await post('/uploadGJMessage20.php', request), '1');
+        assert.equal(countNotices(), notices + 2);
+        // A recipient without a prior DM gets a conversation with the original sender.
+        assert.equal(await post('/accounts/registerGJAccount.php', { userName: 'FreshBridge', password, rsession: 'test', secret: 'Wmfv3899gc9', gameVersion: '22' }, undefined, undefined, { secure: true }), '1');
+        const fresh = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('FreshBridge').accountID;
+        db.prepare('UPDATE profiles SET mS = 0 WHERE accountID = ?').run(fresh);
+        assert.equal(await post('/uploadGJMessage20.php', { ...request, toAccountID: String(fresh) }), '1');
+        const conversation = db.prepare(`SELECT t.threadID FROM threads t JOIN thread_members m ON m.threadID = t.threadID
+            WHERE t.ownerID = 72 AND t.isDM = 1 AND m.accountID = ?`).get(fresh);
+        assert.ok(conversation);
+        assert.equal(db.prepare('SELECT COUNT(*) AS n FROM thread_messages WHERE threadID = ?').get(conversation.threadID).n, 1);
+    });
+    await t.test('bridge strips generated reply subjects and escapes UTF-8 bytes within legacy size limits', async () => {
+        const recipient = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BridgeUser').accountID;
+        const thread = db.prepare(`SELECT t.threadID FROM threads t JOIN thread_members m ON m.threadID = t.threadID
+            WHERE t.ownerID = 72 AND t.isDM = 1 AND m.accountID = ?`).get(recipient).threadID;
+        for (const subject of ['Re: New DM', 'Re: Re: New DM', 'New DM']) {
+            assert.equal(await post('/uploadGJMessage20.php', { ...auth, toAccountID: String(recipient), subject: enc(subject), body: enc(xor('Clean reply', '14251')) }), '1');
+            const reply = db.prepare('SELECT content FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(thread);
+            assert.equal(Buffer.from(reply.content, 'base64').toString(), 'Clean reply');
+        }
+        const cursor = db.prepare('SELECT COALESCE(MAX(ID), 0) AS id FROM messages').get().id;
+        const text = 'ASCII é Ї 😀'.repeat(18);
+        assert.match(await post('/sendGJThreadMessage.php', { accountID: '72', gjp2, gameVersion: '22', threadID: String(thread), body: enc(text) }), /^\d+:\d+$/);
+        const copies = db.prepare('SELECT body FROM messages WHERE ID > ? AND accID = 72 AND toAccountID = ? ORDER BY ID').all(cursor, recipient);
+        assert.ok(copies.length > 1);
+        const parts = copies.map(copy => xor(Buffer.from(copy.body, 'base64').toString(), '14251').toString());
+        assert.ok(copies.every(copy => copy.body.length <= 270));
+        assert.ok(parts.every(part => /^[\x00-\x7F]*$/.test(part)));
+        assert.equal(parts.join(''), String.raw`ASCII \xC3\xA9 \xD0\x87 \xF0\x9F\x98\x80`.repeat(18));
+        assert.ok(parts.every(part => !/\\x(?:[0-9A-F]?)$/.test(part)));
+        assert.equal((await post('/getGJThreads.php', { accountID: '72', gjp2, gameVersion: '22' })).split('#')[0].split('|').map(row => row.split(':')).find(row => Number(row[1]) === recipient)[25], '4');
+    });
+    await t.test('legacy group invites, commands and chat follow core membership rules', async () => {
+        const ids = [];
+        for (const name of ['GroupOwner', 'GroupAlice', 'GroupBob', 'GroupOutsider']) {
+            assert.equal(await post('/accounts/registerGJAccount.php', { userName: name, password, rsession: 'test', secret: 'Wmfv3899gc9', gameVersion: '22' }, undefined, undefined, { secure: true }), '1');
+            ids.push(db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get(name).accountID);
+        }
+        const [owner, alice, bob, outsider] = ids;
+        for (const id of [alice, bob]) db.prepare('INSERT INTO friendships (person1, person2, isNew1, isNew2) VALUES (?, ?, 0, 0)').run(owner, id);
+        const modern = id => ({ accountID: String(id), gjp2, gameVersion: '22' });
+        const legacyCommand = (id, command, subject = 'Command') => post('/uploadGJMessage20.php', { ...auth, accountID: String(id), toAccountID: '71', subject: enc(subject), body: enc(xor(command, '14251')) });
+        const inbox = id => db.prepare('SELECT * FROM messages WHERE toAccountID = ? AND accID = 71 ORDER BY ID').all(id);
+        const plaintext = message => xor(Buffer.from(message.body, 'base64').toString(), '14251').toString();
+        const created = await post('/sendGJThreadMessage.php', { ...modern(owner), subject: enc('Legacy Club'), description: enc('A cross-version group'), targets: enc(`${alice},${bob}`), body: '' });
+        assert.match(created, /^\d+:\d+:2:0$/);
+        const group = Number(created.split(':')[0]);
+        const invitation = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club');
+        assert.ok(invitation.length);
+        const inviteText = invitation.map(plaintext).join('');
+        assert.match(inviteText, /A cross-version group/);
+        assert.ok(inviteText.includes(`accept_group ${group}`));
+        assert.ok(inviteText.includes(`deny_group ${group}`));
+        assert.equal(await legacyCommand(outsider, `accept_group ${group}`), '-1');
+        assert.equal(await legacyCommand(outsider, `list_group_members ${group}`), '-1');
+        assert.equal(await legacyCommand(outsider, `report_group ${group}`), '-1');
+        assert.equal(await legacyCommand(alice, 'Premature', `group ${group}`), '-1');
+        assert.equal(await legacyCommand(alice, `accept_group ${group}`), '1');
+        assert.equal(await legacyCommand(alice, `accept_group ${group}`), '-1');
+        assert.equal(await legacyCommand(bob, `deny_group ${group}`), '1');
+        assert.equal(db.prepare('SELECT ignoredInvite FROM thread_members WHERE threadID = ? AND accountID = ?').get(group, bob).ignoredInvite, 1);
+        const beforeBob = inbox(bob).length;
+        assert.match(await post('/sendGJThreadMessage.php', { ...modern(owner), threadID: String(group), body: enc('Hello legacy group!') }), /^\d+:\d+$/);
+        assert.equal(inbox(bob).length, beforeBob);
+        const received = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group Legacy Club: GroupOwner');
+        assert.equal(received.length, 1);
+        assert.match(plaintext(received[0]), /Hello legacy group!/);
+        assert.equal(await legacyCommand(alice, 'Hello modern group!', `group ${group}`), '1');
+        const latest = db.prepare('SELECT * FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(group);
+        assert.equal(latest.accountID, alice);
+        assert.equal(Buffer.from(latest.content, 'base64').toString(), 'Hello modern group!');
+        assert.equal(inbox(owner).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group Legacy Club: GroupAlice').length, 1);
+        assert.equal(await legacyCommand(alice, `list_group_members ${group}`), '1');
+        assert.ok(inbox(alice).slice(-1).map(plaintext).join('').includes('GroupAlice'));
+        assert.equal(await legacyCommand(alice, 'list_joined_groups'), '1');
+        assert.equal(plaintext(inbox(alice).slice(-1)[0]), `${group} - Legacy Club`);
+        assert.equal(await legacyCommand(alice, `report_group ${group}`), '1');
+        const report = db.prepare('SELECT * FROM reports WHERE accountID = ? AND targetID = ?').get(alice, group);
+        assert.equal(report.type, 8);
+        assert.equal(report.reasons, '0');
+        db.prepare('UPDATE threads SET locked = 1 WHERE threadID = ?').run(group);
+        assert.equal(await legacyCommand(alice, 'Locked', `group ${group}`), '-1');
+        db.prepare('UPDATE threads SET locked = 0 WHERE threadID = ?').run(group);
+        // The bridge uses the same 20 messages/minute limit as current clients.
+        db.prepare('UPDATE thread_messages SET timestamp = 1 WHERE accountID = ?').run(alice);
+        for (let i = 0; i < 20; i++) db.prepare('INSERT INTO thread_messages (threadID, accountID, content, timestamp, isSystem) VALUES (?, ?, ?, ?, 0)').run(group, alice, enc('Rate limit fixture'), Math.floor(Date.now() / 1000));
+        assert.equal(await legacyCommand(alice, 'Rate limited', `group ${group}`), '-1');
+        assert.equal(await legacyCommand(alice, `leave_group ${group}`), '1');
+        assert.equal(await legacyCommand(alice, 'After leaving', `group ${group}`), '-1');
+        const afterLeave = inbox(alice).length;
+        assert.equal(await legacyCommand(alice, `list_group_members ${group}`), '-1');
+        assert.equal(inbox(alice).length, afterLeave);
+        assert.equal(await legacyCommand(alice, 'list_joined_groups'), '1');
+        assert.equal(plaintext(inbox(alice).slice(-1)[0]), 'No joined groups.');
+        // Reinviting a former member produces another legacy invitation.
+        const invitesBefore = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club').length;
+        assert.match(await post('/updateGJThread.php', { ...modern(owner), threadID: String(group), mode: '4', value: enc(String(alice)) }), /^:/);
+        assert.ok(inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club').length > invitesBefore);
+        assert.equal(await legacyCommand(alice, `accept_group ${group}`), '1');
+        assert.equal(await legacyCommand(owner, `leave_group ${group}`), '1');
+        assert.equal(db.prepare('SELECT ownerID FROM threads WHERE threadID = ?').get(group).ownerID, alice);
+        assert.equal(await legacyCommand(alice, `leave_group ${group}`), '1');
+        assert.equal(db.prepare('SELECT 1 FROM threads WHERE threadID = ?').get(group), undefined);
+    });
+    await t.test('news subscriptions deliver only newly published local articles with image footers', async () => {
+        db.prepare('INSERT OR IGNORE INTO dashboard_news_settings (id, version) VALUES (1, 1001)').run();
+        const article = (id, extra = {}) => ({ id, publishDate: 'November 11, 2026', title: `Article ${id}`, body: `Text of article ${id}`, ...extra });
+        newsContent.saveNewsItems([article(1)]);
+        const alice = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BridgeUser').accountID;
+        const bob = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('FreshBridge').accountID;
+        const command = (id, text, extra = {}) => post('/uploadGJMessage20.php', { ...auth, accountID: String(id), toAccountID: '71', subject: enc('News'), body: enc(xor(text, '14251')), ...extra });
+        const copies = id => db.prepare('SELECT * FROM messages WHERE toAccountID = ? AND accID = 71 ORDER BY ID').all(id)
+            .filter(message => Buffer.from(message.subject, 'base64').toString().startsWith('News: '));
+        const text = messages => messages.map(message => xor(Buffer.from(message.body, 'base64').toString(), '14251').toString()).join('');
+        assert.equal(await command(alice, 'subscribe_news', { gjp: enc(xor('wrong', '37526')) }), '-1');
+        assert.equal(await command(alice, 'subscribe_news'), '1');
+        assert.equal(await command(alice, 'subscribe_news'), '1');
+        assert.equal(copies(alice).length, 0); // No backlog on subscription.
+        // Put the footer across a normal chunk boundary to verify it stays intact.
+        const announcement = 'A long announcement. '.repeat(17);
+        const header = 'Article 2\nNovember 11, 2026\n\n';
+        const padding = (190 - (header.length + announcement.length) % 195 + 195) % 195;
+        newsContent.saveNewsItems([article(1), article(2, { body: announcement + 'X'.repeat(padding), imageFile: 'launch.png' })]);
+        const delivered = copies(alice);
+        assert.ok(delivered.length > 1);
+        assert.ok(delivered.every(message => message.body.length <= 270));
+        assert.ok(text(delivered).includes('A long announcement. '.repeat(17).trim()));
+        assert.ok(text(delivered.slice(-1)).endsWith('[Image attached: launch.png]'));
+        assert.ok(text(delivered).endsWith('[Image attached: launch.png]'));
+        assert.equal(copies(bob).length, 0);
+        const count = delivered.length;
+        newsContent.saveNewsItems([article(1), article(2, { body: 'Edited article', imageFile: 'launch.png' })]);
+        assert.equal(copies(alice).length, count); // Editing is not a publication.
+        const next = [article(1), article(2), article(3), article(4, { body: '', imageFile: 'image-only.jpg' })];
+        newsContent.saveNewsItems(next);
+        const newest = copies(alice).slice(count);
+        assert.ok(text(newest).startsWith('Article 4'));
+        assert.ok(text(newest).endsWith('[Image attached: image-only.jpg]'));
+        assert.ok(!text(newest).includes('Article 3')); // Only the latest new article in a save.
+        const afterBatch = copies(alice).length;
+        newsContent.saveNewsItems(next);
+        assert.equal(copies(alice).length, afterBatch);
+        assert.equal(await command(bob, 'subscribe_news'), '1');
+        db.prepare('UPDATE accounts SET isDisabled = 1 WHERE accountID = ?').run(bob);
+        newsContent.saveNewsItems([...next, article(5)]);
+        db.prepare('UPDATE accounts SET isDisabled = 0 WHERE accountID = ?').run(bob);
+        assert.equal(copies(bob).length, 0);
+        assert.ok(!text(copies(alice).slice(afterBatch)).includes('[Image attached:'));
+        assert.equal(await command(alice, 'unsubscribe_news'), '1');
+        const afterUnsubscribe = copies(alice).length;
+        newsContent.saveNewsItems([...next, article(5), article(6)]);
+        assert.equal(copies(alice).length, afterUnsubscribe);
+        assert.ok(text(copies(bob)).includes('Article 6'));
+
+        // A static/official feed takes precedence over the dashboard; never send its copies.
+        const staticPath = path.join(temporary, 'official-news.dat');
+        fs.writeFileSync(staticPath, 'Copied official feed');
+        let publish;
+        const sent = [];
+        require('../newsBridge')({ db, registerHook(name, handler) { publish = handler; } }, (...args) => sent.push(args), { staticNewsPath: staticPath });
+        db.prepare('INSERT INTO dashboard_news (newsID, publishDate, title, body) VALUES (7, ?, ?, ?)').run('Today', 'Static override', 'Should not be delivered');
+        publish({ method: 'run', sql: 'UPDATE dashboard_news_settings SET version = version + 1 WHERE id = 1', execute: () => ({ changes: 1 }) });
+        assert.equal(sent.length, 0);
+        fs.unlinkSync(staticPath);
+        // Re-enabling local news must not replay articles suppressed by the static feed.
+        publish({ method: 'run', sql: 'UPDATE dashboard_news_settings SET version = version + 1 WHERE id = 1', execute: () => ({ changes: 1 }) });
+        assert.equal(sent.length, 0);
     });
     await t.test('guests never consume the first registered administrator account', async () => {
         db.exec('DELETE FROM legacy_compat_guests; DELETE FROM accounts; DELETE FROM profiles;');

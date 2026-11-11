@@ -12,9 +12,7 @@ function getMessageProfile(message, accountID) {
     const profile = db.prepare('SELECT userName, accountID FROM profiles WHERE accountID = ?').get(accountID);
     if (profile) return profile;
 
-    if (message.accID === welcomeMessageSender.accountID &&
-        message.userName === welcomeMessageSender.userName &&
-        message.subject === welcomeMessageSender.subject) {
+    if (accountID === welcomeMessageSender.accountID) {
         return welcomeMessageSender;
     }
 

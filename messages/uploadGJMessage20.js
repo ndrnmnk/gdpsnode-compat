@@ -27,8 +27,16 @@ module.exports = {
         const recipientProfile = db.prepare('SELECT mS FROM profiles WHERE accountID = ?').get(toAccountID);
         const recipientAccount = db.prepare('SELECT * FROM accounts WHERE accountID = ?').get(toAccountID);
 
-        if (!account || !senderProfile || !recipientAccount) return res.send('-1');
+        if (!account || !senderProfile) return res.send('-1');
         if (account.gjp2 !== gjp2) return res.send('-1');
+        if (account.isDisabled === 1) return res.send('-1');
+        if (toAccountID === 71 && req.legacyMessageBridge) {
+            const bridge = req.legacyMessageBridge;
+            const group = /^group\s+([1-9]\d*)$/i.exec(Buffer.from(subject, 'base64').toString('utf8').trim());
+            if (group) return res.send(bridge.sendGroup(accountID, Number(group[1]), bridge.readLegacyBody(body)) ? '1' : '-1');
+            return res.send(bridge.command(accountID, bridge.readLegacyBody(body)) ? '1' : '-1');
+        }
+        if (!recipientAccount) return res.send('-1');
         if (account.isDisabled === 1 || recipientAccount.isDisabled === 1) return res.send('-1');
 
         try {
@@ -43,7 +51,16 @@ module.exports = {
             }
 
             const uploadDate = Math.floor(Date.now() / 1000);
-            const inf = db.prepare('INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp) VALUES (?, ?, ?, ?, ?, ?)').run(subject, body, accountID, senderProfile.userName, toAccountID, uploadDate);
+            const inf = db.transaction(() => {
+                const result = db.prepare('INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp) VALUES (?, ?, ?, ?, ?, ?)').run(subject, body, accountID, senderProfile.userName, toAccountID, uploadDate);
+                if (result.changes) req.legacyMessageBridge?.forwardLegacy(accountID, toAccountID, subject, body);
+                if (result.changes && (!req.legacyMessageBridge || req.legacyMessageBridge.notificationsEnabled(toAccountID))) utils.notifAdd({
+                    toAccountID, type: 15, accountID, username: senderProfile.userName,
+                    title: 'New legacy message',
+                    description: `${senderProfile.userName} sent you a legacy message. Read it in your DMs or legacy inbox. Send legacy_notif 0 to GDPSnode Notifications to mute these notifications.`
+                });
+                return result;
+            })();
 
             if (inf.changes > 0) return res.send('1');
         } catch (err) {

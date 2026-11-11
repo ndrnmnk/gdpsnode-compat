@@ -40,9 +40,7 @@ module.exports = {
                 message.isNew = 0;
             }
             let otherProfile = db.prepare('SELECT userName, accountID FROM profiles WHERE accountID = ?').get(otherAccountID);
-            if (!otherProfile && message.accID === welcomeMessageSender.accountID &&
-                message.userName === welcomeMessageSender.userName &&
-                message.subject === welcomeMessageSender.subject) {
+            if (!otherProfile && otherAccountID === welcomeMessageSender.accountID) {
                 otherProfile = welcomeMessageSender;
             }
 

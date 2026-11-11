@@ -5,9 +5,9 @@ const zlib = require('node:zlib');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { promisify } = require('node:util');
 const legacyLikes = require('./legacyLikes');
-const legacyChallenges = require('./legacyChallenges');
 const legacyGauntlets = require('./legacyGauntlets');
 const legacyUsers = require('./legacyUsers');
+const config = require('./config.js');
 const unzip = promisify(zlib.unzip);
 const gzip = promisify(zlib.gzip);
 const MAX_BYTES = 50 * 1024 * 1024;
@@ -136,6 +136,20 @@ module.exports = {
     name: 'legacy-compat',
     metadata: { version: '1.0.0' },
     install(api) {
+        if (config.allow_insecure_login) {
+            console.warn('\x1b[1;31m⚠ legacy-compat: allow_insecure_login is enabled! Account passwords may be sent over unencrypted HTTP.\x1b[0m');
+        }
+        // Run before the bridge, which can answer requests in its own middleware.
+        api.use((req, res, next) => {
+            const body = req.method === 'GET' ? req.query || {} : req.body || {};
+            const binaryVersion = Number(body.binaryVersion ?? 0);
+            if (config.min_binary_version > 0 &&
+                (!Number.isFinite(binaryVersion) || binaryVersion < config.min_binary_version)) {
+                return res.type('text/plain').send('-1');
+            }
+            return next();
+        });
+        const messageBridge = config.allow_message_bridge ? require('./messageBridge')(api) : undefined;
         const context = new AsyncLocalStorage();
         api.db.exec(`CREATE TABLE IF NOT EXISTS legacy_compat_guests (
             deviceHash TEXT PRIMARY KEY, accountID INTEGER NOT NULL UNIQUE
@@ -167,13 +181,24 @@ module.exports = {
             const body = req.body || (req.body = {});
             // Express assesses TLS and trusted proxy forwarding in req.secure.
             // Do not trust a raw X-Forwarded-Proto header or the claimed game version.
-            // if (/^\/accounts\/(?:login|register)GJAccount\.php\/?$/i.test(original) &&
-            //     Object.hasOwn(body, 'password') && req.secure !== true) {
-            //     return res.type('text/plain').send('-1');
-            // }
+            if (!config.allow_insecure_login && /^\/accounts\/(?:login|register)GJAccount\.php\/?$/i.test(original) &&
+                Object.hasOwn(body, 'password') && req.secure !== true) {
+                return res.type('text/plain').send('-1');
+            }
             if (!/\.php$/.test(original)) return next();
             const gameVersion = version(body, original);
             const target = aliases[original] || original;
+            const unregistered = body.accountID == null || body.accountID === '' || body.accountID === '0';
+            const guestOption = {
+                '/uploadGJLevel21.php': 'allow_unregistered_level_uploads',
+                '/uploadGJComment21.php': 'allow_unregistered_comments',
+                '/likeGJItem211.php': 'allow_unregistered_likes',
+                '/rateGJStars211.php': 'allow_unregistered_rates'
+            }[target];
+            if ((original === '/likeGJLevel.php' && !config['allow_1.0_likes']) ||
+                (unregistered && guestOption && !config[guestOption])) {
+                return res.type('text/plain').send('-1');
+            }
             const legacy = gameVersion < 22 || typeof body.gjp === 'string' ||
                 typeof body.password === 'string' && /(?:login|backup|sync|register)GJAccount/.test(original);
             if (!legacy) {
@@ -244,9 +269,6 @@ module.exports = {
                         if (typeof body.gjp === 'string' && body.gjp.length <= 1024) password = xor(decode(body.gjp).toString('binary'), '37526').toString();
                         else if (typeof body.password === 'string' && /(?:login|backup|sync)GJAccount/.test(original)) password = body.password;
                         if (password !== undefined) body.gjp2 = api.utils.generateGJP2(password);
-                    }
-                    if (target === '/getGJChallenges.php' && gameVersion < 22) {
-                        return res.type('text/plain').send(legacyChallenges.response(api.db, body));
                     }
                     if (target === '/getGJLevels21.php' && body.gauntlet != null && body.gauntlet !== '' && body.gauntlet !== '0') {
                         if (body.secret !== 'Wmfd2893gb7') return res.type('text/plain').send('-1');
@@ -394,6 +416,7 @@ module.exports = {
             const endpoint = require(`./messages/${name}GJMessage${name === 'get' || name === 'delete' ? 's' : ''}20`);
             api.addEndpoint({ ...endpoint, handler(req, res, next) {
                 if ((name === 'get' || name === 'download') && !context.getStore()) return next();
+                req.legacyMessageBridge = messageBridge;
                 return endpoint.handler(req, res, next);
             } });
         }

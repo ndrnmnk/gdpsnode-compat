@@ -43,7 +43,7 @@ A pending friend request in either direction prevents sending another request be
 
 A recipient with stored `frS=0` accepts empty friend requests only; choose all/text-enabled requests in their settings to accept a request with text. Legacy message `mS=1` is friends-only and `mS=2` disallows messages, including from friends. A valid 2.0 payload is still rejected if that recipient policy is not satisfied.
 
-Legacy messages and current thread conversations remain separate. There is no automatic migration between them, and legacy messages do not generate thread notifications. Existing core bans, validation, rate limits, and permissions still apply. Uploads with the same owner/name update the existing level and return its ID, as in core; a different name creates a new level. Re-uploading a 2.01 level with its original name also repairs a version-21 tag left by the older plugin. Genuine 2.1 levels are not globally downgraded. Cross-version cloud saves share the core save slot; the plugin does not translate save contents or downgrade newer game data. The core's existing body-size limits also apply to aliased requests.
+Every registered account receives welcome instructions in both its legacy inbox and a system DM. Reply to GDPSnode Notifications (account 71) with `message_bridge 1` to forward future incoming DMs into the legacy inbox, or `message_bridge 0` to stop. Commands work through either message format. Forwarded messages retain the original sender. Non-ASCII characters are escaped as UTF-8 bytes (for example, `é` becomes `\xC3\xA9`), and long messages are split into legacy-sized parts without splitting a character’s escapes. Previous DMs are not forwarded. Accepted legacy messages are also delivered to the DM conversation with the original sender, including their subject and body. Bridge-generated `New DM` subjects and their `Re:` prefixes are omitted from translated replies. Existing DMs are reused, and translations are not echoed back as extra legacy messages. Legacy messages also generate a personal notification with the sender name. Send `legacy_notif 0` to GDPSnode Notifications through either inbox to disable these notifications, or `legacy_notif 1` to restore them. Notifications are enabled by default; the preference is stored in `legacy_compat_notifications`. Forwarded DMs do not generate duplicate notifications. The DM forwarding preference is stored in `legacy_compat_message_bridge`. Existing core bans, validation, rate limits, and permissions still apply. Uploads with the same owner/name update the existing level and return its ID, as in core; a different name creates a new level. Re-uploading a 2.01 level with its original name also repairs a version-21 tag left by the older plugin. Genuine 2.1 levels are not globally downgraded. Cross-version cloud saves share the core save slot; the plugin does not translate save contents or downgrade newer game data. The core's existing body-size limits also apply to aliased requests.
 
 Removing this directory disables the compatibility layer. Existing guest profiles, levels, and messages remain in the database; removing the mapping table would make those device identities unreachable, so retain it if you plan to re-enable the plugin.
 
@@ -59,4 +59,39 @@ The suite uses Node's test API, the real core endpoint modules, the real core sc
 
 Coverage includes the captured 2.0 friend-request/message payloads, classic privacy-setting round trips, paired opposite-direction 2.0/2.2 requests with reverse pending-request handling and sender-message-setting independence, no-text/friends-only/no-messages settings and blocks, green guest names on old/current clients, nickname changes, 2.1 guest comment checksums, captured guest deletion routes, cross-device ownership and rated-level restrictions, omitted account-comment targets, core file/data cleanup, the captured logged-out daily chest request, guest player/account IDs, reward nonce/hash, per-device counts/cooldowns and expiry, unchanged signed-in/modern rewards, captured gauntlet membership/order/hash, downloads of all five levels, malformed and inaccessible gauntlets, signed-in/anonymous quest responses, empty and partial quest configuration, nonce/hash validation and UTC rollover, 2.1 anonymous votes/uploads with placeholder credentials, the captured signed-in comment dislike after an existing native vote, rejection of invalid authenticated credentials, all four captured 2.01 request shapes, version-20 storage/search/download, same-name revisions and repair of an incorrect tag, distinct-name new uploads, World detection, HTTPS-only plaintext account operations across versions, rejection of forged forwarding headers, the captured 1.9 star-rating request with all ten rating values, the captured double-slash dislike request after an existing vote, visibility through modern level/comment endpoints, anonymous action quotas and comment spam state, the exact sparse 1.0/1.4 vote forms, all five face-rating conversions, duplicate votes, level/comment likes and dislikes, zero-star leaderboards, device-based relative leaderboards, credential failures, preservation of newer stats, raw/zlib uploads and download hashes, old search pagination and OR filters, gauntlet filtering, comment formats, persistent isolated guests, inbox privacy and read state, modern inbox passthrough, backups, concurrent request isolation, and first-registration permissions. Protocol fixtures cover pre-1.9, 1.9, 2.0-style routes, 2.1, and modern passthrough. Actual game binaries and a running Express deployment have not been tested here.
 
-The HTTPS regression is automatically skipped while its guard is commented out locally for client testing. Uncommenting the existing guard enables that check again; the test runner does not alter the plugin or enable the guard.
+The HTTPS regression runs when `allow_insecure_login` is disabled.
+
+
+## Legacy group chats
+
+Group invitations arrive from GDPSnode Notifications (account 71), with the group name as the subject and the description, group ID, and command instructions in the body. Send commands to that account in the message body:
+
+- `accept_group ID` / `deny_group ID`: accept or decline an invitation.
+- `list_group_members ID`: list the active members of a joined group.
+- `report_group ID`: report an invited or joined group with reason `0`.
+- `leave_group ID`: leave a joined group.
+- `list_joined_groups`: list joined groups as `group id - group name`, one per line.
+
+To post, send a legacy message to account 71 with subject `group ID` and your text as the body. New group messages reach active members in legacy messages with subject `Group NAME: AUTHOR`; pending invitations, departed members, hidden or muted memberships, and disabled accounts receive no chat copies. The author does not receive an echo. Invitations and group forwarding do not require `message_bridge 1`. Membership actions, locks, ownership transfer and rate limits use the core group handlers. Group commands also work in the Notifications DM. Long or non-ASCII subjects are escaped/truncated to the classic subject limit; the full group name and ID remain in the message body. Existing chat history is not copied.
+
+
+## Legacy news subscriptions
+
+Send `subscribe_news` to GDPSnode Notifications (account 71), through either inbox, to receive future local news articles as legacy messages. `unsubscribe_news` stops delivery. Subscribing does not send existing articles. When a dashboard save publishes a new highest article ID, subscribers receive its title, date and text immediately; the last message ends with `[Image attached: filename]` when an image is attached. Long articles use multiple legacy messages and the usual UTF-8 escapes. Only the latest article in a save is sent. Edits, deleted/reused article IDs, and server restarts do not resend articles. Disabled accounts are skipped.
+
+The bridge watches local dashboard publications only. It does not fetch or import the official feed, and skips delivery when a static `endpoints/content/news/news.dat` overrides dashboard news. Manually pasting official text into a new dashboard article has no source metadata and is treated as a local publication. Subscriptions and seen article IDs persist in `legacy_compat_news_subscribers` and `legacy_compat_news_seen`.
+
+## Configuration
+
+Edit `config.js` in this directory and restart the server to apply changes.
+
+| Option | Behavior |
+| --- | --- |
+| `min_binary_version` | Reject requests below this binary version with `-1`, including modern endpoints and bridge requests. Missing binary versions count as zero; `0` disables the limit. |
+| `allow_1.0_likes` | Allow the original `likeGJLevel.php` route. |
+| `allow_unregistered_level_uploads` | Allow level uploads without an account. |
+| `allow_unregistered_comments` | Allow level comments without an account. |
+| `allow_unregistered_likes` | Allow likes/dislikes without an account, including original 1.0 likes. |
+| `allow_unregistered_rates` | Allow ratings without an account. |
+| `allow_message_bridge` | Enable message bridging, notification commands, group bridging, and news subscriptions. Disabling this keeps ordinary legacy messages available. |
+| `allow_insecure_login` | Allow plaintext login/registration over HTTP. Disabled by default; enabling it prints a red startup warning. |
