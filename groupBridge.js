@@ -67,14 +67,14 @@ module.exports = function groupBridge(db, legacy) {
             const target = Number(fields[3]);
             const invitation = db.prepare('SELECT status FROM thread_members WHERE threadID = ? AND accountID = ?').get(group.threadID, target);
             if (invitation?.status !== 0) return;
-            notify(target, group.title, `Group ${group.threadID}: ${group.title}\n${group.description}\nAccept: accept_group ${group.threadID}\nDecline: deny_group ${group.threadID}\nAfter joining, send a message to GDPSnode Notifications with subject "group ${group.threadID}" to chat.`);
+            notify(target, `Group invite: ${group.title}`, `Group ${group.threadID}: ${group.title}\n${group.description}\nAccept: accept_group ${group.threadID}\nDecline: deny_group ${group.threadID}\nAfter joining, send a message to GDPSnode Notifications with subject "group ${group.threadID}" to chat.`);
             return;
         }
         const author = db.prepare('SELECT userName FROM profiles WHERE accountID = ?').get(message.accountID)?.userName || 'Player';
         const recipients = db.prepare(`SELECT m.accountID FROM thread_members m JOIN accounts a ON a.accountID = m.accountID
             WHERE m.threadID = ? AND m.status = 1 AND m.hidden = 0 AND m.muted = 0 AND m.accountID != ? AND a.isDisabled = 0`).all(group.threadID, message.accountID);
         for (const recipient of recipients) notify(recipient.accountID, `Group ${group.title}: ${author}`,
-            `Group ${group.threadID}: ${group.title}\n${author}: ${decode(message.content)}\nReply with subject "group ${group.threadID}".`);
+            `${decode(message.content)}\nGroup ID ${group.threadID}`);
     }
     return { command, sendLegacy, onMessage };
 };
