@@ -17,8 +17,9 @@ And it adds:
 - legacy group chats
 - news subscriptions
 
-What it does **not** add is level conversion to older versions. 
-For example, 1.9 level will only be playable in 1.9 and above, and older clients won't be able to access it.
+What it does **not** add:
+- level conversion to older versions
+- group creation and ownership for legacy users
 
 ## Legacy messages
 
