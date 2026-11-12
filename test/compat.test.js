@@ -936,6 +936,61 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         assert.ok(parts.every(part => !/\\x(?:[0-9A-F]?)$/.test(part)));
         assert.equal((await post('/getGJThreads.php', { accountID: '72', gjp2, gameVersion: '22' })).split('#')[0].split('|').map(row => row.split(':')).find(row => Number(row[1]) === recipient)[25], '4');
     });
+    await t.test('linked DM deletions clean up both directions, split copies and authorized bulk deletes', async () => {
+        const recipient = db.prepare('SELECT accountID FROM accounts WHERE userName = ?').get('BridgeUser').accountID;
+        const thread = db.prepare(`SELECT t.threadID FROM threads t JOIN thread_members m ON m.threadID = t.threadID
+            WHERE t.ownerID = 72 AND t.isDM = 1 AND m.accountID = ?`).get(recipient).threadID;
+        const modern = { accountID: '72', gjp2, gameVersion: '22', threadID: String(thread) };
+        const send = text => post('/sendGJThreadMessage.php', { ...modern, body: enc(text) });
+        const copies = id => db.prepare('SELECT legacyID FROM legacy_compat_message_links WHERE messageID = ? ORDER BY legacyID').all(id).map(row => row.legacyID);
+        const missing = (id, ids) => {
+            assert.equal(db.prepare('SELECT 1 FROM thread_messages WHERE messageID = ?').get(id), undefined);
+            assert.equal(copies(id).length, 0);
+            for (const legacyID of ids) assert.equal(db.prepare('SELECT 1 FROM messages WHERE ID = ?').get(legacyID), undefined);
+        };
+        const id = Number((await send('Split deletion '.repeat(50))).split(':')[1]);
+        const ids = copies(id);
+        assert.ok(ids.length > 1);
+        assert.equal(await post('/deleteGJMessages20.php', { ...auth, accountID: '74', messageID: String(ids[0]) }), '1');
+        assert.ok(db.prepare('SELECT 1 FROM thread_messages WHERE messageID = ?').get(id));
+        assert.equal(await post('/deleteGJMessages20.php', { ...auth, accountID: String(recipient), messageID: String(ids[0]) }), '1');
+        missing(id, ids);
+        const modernID = Number((await send('Delete from modern client')).split(':')[1]);
+        const modernCopies = copies(modernID);
+        assert.ok(modernCopies.length);
+        assert.equal(await post('/updateGJThread.php', { ...modern, mode: '12', value: enc(String(modernID)) }), '1');
+        missing(modernID, modernCopies);
+        const legacyIDs = [];
+        const messageIDs = [];
+        for (let i = 0; i < 2; i++) {
+            assert.equal(await post('/uploadGJMessage20.php', { ...auth, toAccountID: String(recipient), subject: enc('Tracked reply'), body: enc(xor(`Reply ${i}`, '14251')) }), '1');
+            const latest = db.prepare('SELECT messageID FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(thread).messageID;
+            messageIDs.push(latest);
+            legacyIDs.push(...copies(latest));
+        }
+        assert.equal(legacyIDs.length, 2);
+        assert.equal(await post('/deleteGJMessages20.php', { ...auth, messages: legacyIDs.join(',') }), '1');
+        messageIDs.forEach((messageID, i) => missing(messageID, [legacyIDs[i]]));
+        // Upgrade a DM created by an older plugin without tracking, then delete from Sent.
+        assert.equal(await post('/uploadGJMessage20.php', { ...auth, toAccountID: String(recipient), subject: enc('Old untracked DM'), body: enc(xor('Recover this exact match', '14251')) }), '1');
+        const oldID = db.prepare('SELECT messageID FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(thread).messageID;
+        const oldCopies = copies(oldID);
+        db.prepare('DELETE FROM legacy_compat_message_links WHERE messageID = ?').run(oldID);
+        require('../repairMessageLinks')(db, (messageID, legacyIDs) => {
+            for (const legacyID of legacyIDs) db.prepare('INSERT INTO legacy_compat_message_links (legacyID, messageID) VALUES (?, ?)').run(legacyID, messageID);
+        }, body => xor(Buffer.from(body, 'base64').toString(), '14251').toString());
+        assert.deepEqual(copies(oldID), oldCopies);
+        const version = db.prepare('SELECT mv FROM threads WHERE threadID = ?').get(thread).mv;
+        assert.equal(await post('/deleteGJMessages20.php', { ...auth, messageID: String(oldCopies[0]), isSender: '1' }), '1');
+        missing(oldID, oldCopies);
+        assert.ok(db.prepare('SELECT mv FROM threads WHERE threadID = ?').get(thread).mv > version);
+        const refreshed = await post('/getGJThreadMessages.php', modern);
+        assert.ok(!refreshed.split('#')[0].split('|').some(row => Number(row.split(':')[0]) === oldID));
+        const clearID = Number((await send('Whole conversation deletion')).split(':')[1]);
+        const clearCopies = copies(clearID);
+        db.prepare('DELETE FROM thread_messages WHERE threadID = ?').run(thread);
+        missing(clearID, clearCopies);
+    });
     await t.test('legacy group invites, commands and chat follow core membership rules', async () => {
         const ids = [];
         for (const name of ['GroupOwner', 'GroupAlice', 'GroupBob', 'GroupOutsider']) {
@@ -948,10 +1003,39 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         const legacyCommand = (id, command, subject = 'Command') => post('/uploadGJMessage20.php', { ...auth, accountID: String(id), toAccountID: '71', subject: enc(subject), body: enc(xor(command, '14251')) });
         const inbox = id => db.prepare('SELECT * FROM messages WHERE toAccountID = ? AND accID = 71 ORDER BY ID').all(id);
         const plaintext = message => xor(Buffer.from(message.body, 'base64').toString(), '14251').toString();
+        const targetCommand = (id, target, text, extra = {}) => post('/uploadGJMessage20.php', {
+            ...auth, accountID: String(id), toAccountID: String(target), subject: enc('Command'),
+            body: enc(xor(text, '14251')), ...extra
+        });
+        assert.equal(await legacyCommand(owner, 'create_group name="" desc="Invalid"'), '-1');
+        assert.equal(await legacyCommand(owner, 'create_group name="Legacy Owned" desc="Created from an old client"'), '1');
+        const owned = db.prepare('SELECT * FROM threads WHERE title = ?').get('Legacy Owned');
+        assert.equal(owned.ownerID, owner);
+        assert.equal(owned.description, 'Created from an old client');
+        assert.equal(db.prepare('SELECT status FROM thread_members WHERE threadID = ? AND accountID = ?').get(owned.threadID, owner).status, 1);
+        assert.ok(plaintext(inbox(owner).slice(-1)[0]).includes(`Created group ${owned.threadID}`));
+        const rawMessages = () => db.prepare('SELECT COUNT(*) AS count FROM messages WHERE accID = ? AND toAccountID = ?').get(owner, alice).count;
+        const beforeCommands = rawMessages();
+        assert.equal(await targetCommand(owner, alice, `invite_to_group ${owned.threadID}`, { gjp: enc(xor('wrong', '37526')) }), '-1');
+        assert.equal(await targetCommand(outsider, alice, `invite_to_group ${owned.threadID}`), '-1');
+        assert.equal(await targetCommand(owner, alice, `invite_to_group ${owned.threadID}`), '1');
+        assert.equal(await targetCommand(owner, alice, `transfer_group ${owned.threadID}`), '-1');
+        assert.equal(await legacyCommand(alice, `accept_group ${owned.threadID}`), '1');
+        assert.equal(await targetCommand(alice, owner, `transfer_group ${owned.threadID}`), '-1');
+        assert.equal(await targetCommand(alice, owner, `kick_from_group ${owned.threadID}`), '-1');
+        assert.equal(await targetCommand(owner, owner, `transfer_group ${owned.threadID}`), '-1');
+        assert.equal(await targetCommand(owner, alice, 'transfer_group 9007199254740992'), '-1');
+        assert.equal(await targetCommand(owner, alice, `transfer_group ${owned.threadID}`), '1');
+        assert.equal(db.prepare('SELECT ownerID FROM threads WHERE threadID = ?').get(owned.threadID).ownerID, alice);
+        assert.equal(await targetCommand(owner, alice, `kick_from_group ${owned.threadID}`), '-1');
+        assert.equal(await targetCommand(alice, owner, `kick_from_group ${owned.threadID}`), '1');
+        assert.equal(db.prepare('SELECT status FROM thread_members WHERE threadID = ? AND accountID = ?').get(owned.threadID, owner).status, 2);
+        assert.equal(rawMessages(), beforeCommands);
+        assert.equal(await legacyCommand(alice, `leave_group ${owned.threadID}`), '1');
         const created = await post('/sendGJThreadMessage.php', { ...modern(owner), subject: enc('Legacy Club'), description: enc('A cross-version group'), targets: enc(`${alice},${bob}`), body: '' });
         assert.match(created, /^\d+:\d+:2:0$/);
         const group = Number(created.split(':')[0]);
-        const invitation = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club');
+        const invitation = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group invite: Legacy Club');
         assert.ok(invitation.length);
         const inviteText = invitation.map(plaintext).join('');
         assert.match(inviteText, /A cross-version group/);
@@ -975,7 +1059,23 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         const latest = db.prepare('SELECT * FROM thread_messages WHERE threadID = ? ORDER BY messageID DESC LIMIT 1').get(group);
         assert.equal(latest.accountID, alice);
         assert.equal(Buffer.from(latest.content, 'base64').toString(), 'Hello modern group!');
+        const sentCopy = db.prepare(`SELECT m.* FROM messages m JOIN legacy_compat_message_links l ON l.legacyID = m.ID
+            WHERE l.messageID = ? AND m.accID = ? AND m.toAccountID = 71`).get(latest.messageID, alice);
+        assert.ok(sentCopy);
+        assert.equal(Buffer.from(sentCopy.subject, 'base64').toString(), `group ${group}`);
+        const sentInbox = await post('/getGJMessages20.php', { ...auth, accountID: String(alice), getSent: '1', page: '0' });
+        assert.ok(sentInbox.split('#')[0].split('|').some(row => Number(fields(row)['1']) === sentCopy.ID));
+        const sentDownload = await post('/downloadGJMessage20.php', { ...auth, accountID: String(alice), messageID: String(sentCopy.ID), isSender: '1' });
+        assert.equal(fields(sentDownload)['9'], '1');
+        assert.equal(plaintext({ body: fields(sentDownload)['5'] }), 'Hello modern group!');
         assert.equal(inbox(owner).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group Legacy Club: GroupAlice').length, 1);
+        // Deleting a group copy removes the source and every recipient's split copies.
+        const groupCopyIDs = db.prepare('SELECT legacyID FROM legacy_compat_message_links WHERE messageID = ?').all(latest.messageID).map(row => row.legacyID);
+        assert.ok(groupCopyIDs.length);
+        assert.equal(await post('/deleteGJMessages20.php', { ...auth, accountID: String(alice), messageID: String(sentCopy.ID), isSender: '1' }), '1');
+        assert.equal(db.prepare('SELECT 1 FROM thread_messages WHERE messageID = ?').get(latest.messageID), undefined);
+        assert.equal(db.prepare('SELECT 1 FROM legacy_compat_message_links WHERE messageID = ?').get(latest.messageID), undefined);
+        for (const id of groupCopyIDs) assert.equal(db.prepare('SELECT 1 FROM messages WHERE ID = ?').get(id), undefined);
         assert.equal(await legacyCommand(alice, `list_group_members ${group}`), '1');
         assert.ok(inbox(alice).slice(-1).map(plaintext).join('').includes('GroupAlice'));
         assert.equal(await legacyCommand(alice, 'list_joined_groups'), '1');
@@ -999,9 +1099,9 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
         assert.equal(await legacyCommand(alice, 'list_joined_groups'), '1');
         assert.equal(plaintext(inbox(alice).slice(-1)[0]), 'No joined groups.');
         // Reinviting a former member produces another legacy invitation.
-        const invitesBefore = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club').length;
+        const invitesBefore = inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group invite: Legacy Club').length;
         assert.match(await post('/updateGJThread.php', { ...modern(owner), threadID: String(group), mode: '4', value: enc(String(alice)) }), /^:/);
-        assert.ok(inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Legacy Club').length > invitesBefore);
+        assert.ok(inbox(alice).filter(message => Buffer.from(message.subject, 'base64').toString() === 'Group invite: Legacy Club').length > invitesBefore);
         assert.equal(await legacyCommand(alice, `accept_group ${group}`), '1');
         assert.equal(await legacyCommand(owner, `leave_group ${group}`), '1');
         assert.equal(db.prepare('SELECT ownerID FROM threads WHERE threadID = ?').get(group).ownerID, alice);

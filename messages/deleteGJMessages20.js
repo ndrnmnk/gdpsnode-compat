@@ -30,6 +30,15 @@ module.exports = {
             const placeholders = messageList.map(() => '?').join(',');
 
             db.transaction(() => {
+                // Resolve permissions before deleting anything. Remove sources explicitly as well
+                // as through triggers, so legacy deletion cannot strand a linked thread message.
+                const ids = messages ? messageList : [messageID];
+                const owned = db.prepare(`SELECT ID FROM messages WHERE ID IN (${ids.map(() => '?').join(',')})
+                    AND (accID = ? OR toAccountID = ?) LIMIT 10`).all(...ids, accountID, accountID);
+                for (const message of owned) {
+                    if (req.legacyMessageBridge) db.prepare(`DELETE FROM thread_messages WHERE messageID IN
+                        (SELECT messageID FROM legacy_compat_message_links WHERE legacyID = ?)`).run(message.ID);
+                }
                 if (messages) {
                     db.prepare(`DELETE FROM messages WHERE ID IN (${placeholders}) AND accID = ? LIMIT 10`).run(...messageList, accountID);
                     db.prepare(`DELETE FROM messages WHERE ID IN (${placeholders}) AND toAccountID = ? LIMIT 10`).run(...messageList, accountID);

@@ -19,7 +19,6 @@ And it adds:
 
 What it does **not** add:
 - level conversion to older versions
-- group creation and ownership for legacy users
 
 ## Legacy messages
 
@@ -44,13 +43,25 @@ Available commands:
 
 Group invitations, messages and commands arrive to and from GDPSnode Notifications (account 71). Set the subject to "group ID" to send a message to a group.
 
-The following group commands are available:
+The following group commands are available (`ID` is the group ID):
 
+- `create_group name="name here" desc="description here"`: create a group owned by you (name up to 64 characters; description up to 500). The reply includes its ID.
 - `accept_group ID` / `deny_group ID`: accept or decline an invitation.
 - `list_group_members ID`: list the active members of a joined group.
 - `report_group ID`: report an invited or joined group with reason `inappropriate content`.
 - `leave_group ID`: leave a joined group.
 - `list_joined_groups`: list joined groups as `group id - group name`, one per line.
+
+Send these commands in a legacy message body **to the target user**, with any subject:
+
+- `invite_to_group ID`: invite that user, subject to the normal invitation permissions and privacy rules.
+- `transfer_group ID`: transfer ownership to that user, who must have joined. Only the owner can transfer.
+- `kick_from_group ID`: remove that joined user. Requires ownership or moderator permissions.
+
+These messages perform the action instead of delivering a normal message. 
+Newly created groups start with only the owner; invite another user and have them accept before chatting.
+
+Deleting the original message (either legacy or new) will delete all the linked copies too.
 
 ## Configuration
 

@@ -30,10 +30,24 @@ module.exports = {
         if (!account || !senderProfile) return res.send('-1');
         if (account.gjp2 !== gjp2) return res.send('-1');
         if (account.isDisabled === 1) return res.send('-1');
+        if (req.legacyMessageBridge) {
+            const result = req.legacyMessageBridge.targetGroupCommand(accountID, toAccountID, req.legacyMessageBridge.readLegacyBody(body));
+            if (result !== null) return res.send(result ? '1' : '-1');
+        }
         if (toAccountID === 71 && req.legacyMessageBridge) {
             const bridge = req.legacyMessageBridge;
             const group = /^group\s+([1-9]\d*)$/i.exec(Buffer.from(subject, 'base64').toString('utf8').trim());
-            if (group) return res.send(bridge.sendGroup(accountID, Number(group[1]), bridge.readLegacyBody(body)) ? '1' : '-1');
+            if (group) {
+                const sent = db.transaction(() => {
+                    const messageID = bridge.sendGroup(accountID, Number(group[1]), bridge.readLegacyBody(body));
+                    if (!messageID) return false;
+                    const copy = db.prepare(`INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp)
+                        VALUES (?, ?, ?, ?, 71, ?)`).run(subject, body, accountID, senderProfile.userName, Math.floor(Date.now() / 1000));
+                    bridge.linkMessage(messageID, [Number(copy.lastInsertRowid)]);
+                    return true;
+                })();
+                return res.send(sent ? '1' : '-1');
+            }
             return res.send(bridge.command(accountID, bridge.readLegacyBody(body)) ? '1' : '-1');
         }
         if (!recipientAccount) return res.send('-1');
@@ -53,7 +67,7 @@ module.exports = {
             const uploadDate = Math.floor(Date.now() / 1000);
             const inf = db.transaction(() => {
                 const result = db.prepare('INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp) VALUES (?, ?, ?, ?, ?, ?)').run(subject, body, accountID, senderProfile.userName, toAccountID, uploadDate);
-                if (result.changes) req.legacyMessageBridge?.forwardLegacy(accountID, toAccountID, subject, body);
+                if (result.changes) req.legacyMessageBridge?.forwardLegacy(accountID, toAccountID, subject, body, Number(result.lastInsertRowid));
                 if (result.changes && (!req.legacyMessageBridge || req.legacyMessageBridge.notificationsEnabled(toAccountID))) utils.notifAdd({
                     toAccountID, type: 15, accountID, username: senderProfile.userName,
                     title: 'New legacy message',

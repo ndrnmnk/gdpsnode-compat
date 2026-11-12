@@ -66,11 +66,20 @@ The HTTPS regression runs when `allow_insecure_login` is disabled.
 
 Group invitations arrive from GDPSnode Notifications (account 71), with the group name as the subject and the description, group ID, and command instructions in the body. Send commands to that account in the message body:
 
+- `create_group name="name here" desc="description here"`: create a group owned by you (name up to 64 characters; description up to 500). The reply includes its ID.
 - `accept_group ID` / `deny_group ID`: accept or decline an invitation.
 - `list_group_members ID`: list the active members of a joined group.
 - `report_group ID`: report an invited or joined group with reason `0`.
 - `leave_group ID`: leave a joined group.
 - `list_joined_groups`: list joined groups as `group id - group name`, one per line.
+
+Send these commands in a legacy message body **to the target user**, with any subject. `ID` is the group ID:
+
+- `invite_to_group ID`: invite that user, subject to the normal invitation permissions and privacy rules.
+- `transfer_group ID`: transfer ownership to that user, who must have joined. Only the owner can transfer.
+- `kick_from_group ID`: remove that joined user. Requires ownership or moderator permissions.
+
+These messages perform the action instead of delivering a normal message. Successful actions send a confirmation from account 71; failures return `-1`. Self-transfers and self-kicks are rejected. Newly created groups start with only the owner; invite another user and have them accept before chatting. All commands require `allow_message_bridge`. The classic message body limit still applies.
 
 To post, send a legacy message to account 71 with subject `group ID` and your text as the body. New group messages reach active members in legacy messages with subject `Group NAME: AUTHOR`; pending invitations, departed members, hidden or muted memberships, and disabled accounts receive no chat copies. The author does not receive an echo. Invitations and group forwarding do not require `message_bridge 1`. Membership actions, locks, ownership transfer and rate limits use the core group handlers. Group commands also work in the Notifications DM. Long or non-ASCII subjects are escaped/truncated to the classic subject limit; the full group name and ID remain in the message body. Existing chat history is not copied.
 
@@ -80,6 +89,14 @@ To post, send a legacy message to account 71 with subject `group ID` and your te
 Send `subscribe_news` to GDPSnode Notifications (account 71), through either inbox, to receive future local news articles as legacy messages. `unsubscribe_news` stops delivery. Subscribing does not send existing articles. When a dashboard save publishes a new highest article ID, subscribers receive its title, date and text immediately; the last message ends with `[Image attached: filename]` when an image is attached. Long articles use multiple legacy messages and the usual UTF-8 escapes. Only the latest article in a save is sent. Edits, deleted/reused article IDs, and server restarts do not resend articles. Disabled accounts are skipped.
 
 The bridge watches local dashboard publications only. It does not fetch or import the official feed, and skips delivery when a static `endpoints/content/news/news.dat` overrides dashboard news. Manually pasting official text into a new dashboard article has no source metadata and is treated as a local publication. Subscriptions and seen article IDs persist in `legacy_compat_news_subscribers` and `legacy_compat_news_seen`.
+
+Legacy group posts are saved in the sender's Sent inbox, addressed to account 71 with subject `group ID`. Opening or deleting that sent entry uses the same linked message as the group chat and recipients' copies. Failed group sends do not create sent entries.
+
+## Forwarded message deletion
+
+Newly bridged messages have persistent links between the thread message and every legacy copy, including split messages and copies delivered to different group members. Deleting any linked legacy copy deletes the thread message and all linked legacy copies. Deleting the thread message does the same, including when a whole conversation is removed. Existing endpoint permissions still control who may delete a message; group copies follow the legacy inbox permissions, so a recipient deleting their copy removes the linked group message for everyone.
+
+Links also cover welcome messages, command replies, and group invitations. Removing an invitation message does not revoke the pending group invitation. SQLite triggers keep cleanup atomic, survive restarts, and remove tracking records along with the messages. Thread history versions advance so clients can refresh. On startup, older untracked DMs are linked only when sender, recipient, timestamp and decoded text give an exact one-to-one match. Ambiguous older messages remain unlinked. Hiding or clearing a conversation without deleting its stored messages does not delete copies.
 
 ## Configuration
 

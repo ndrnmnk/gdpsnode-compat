@@ -19,11 +19,13 @@ module.exports = function install(api) {
     const db = api.db;
     db.exec('CREATE TABLE IF NOT EXISTS legacy_compat_message_bridge (accountID INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)');
     db.exec('CREATE TABLE IF NOT EXISTS legacy_compat_notifications (accountID INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)');
+    const link = require('./messageLinks')(db);
+    require('./repairMessageLinks')(db, link, readLegacyBody);
     let translatingLegacy = false;
     function notificationsEnabled(accountID) {
         return db.prepare('SELECT enabled FROM legacy_compat_notifications WHERE accountID = ?').get(accountID)?.enabled !== 0;
     }
-    function forwardLegacy(sender, recipient, subject, body) {
+    function forwardLegacy(sender, recipient, subject, body, legacyID) {
         let thread = db.prepare(`SELECT t.threadID FROM threads t
             JOIN thread_members s ON s.threadID = t.threadID AND s.accountID = ? AND s.status IN (0, 1)
             JOIN thread_members r ON r.threadID = t.threadID AND r.accountID = ? AND r.status IN (0, 1)
@@ -42,8 +44,9 @@ module.exports = function install(api) {
             const title = decode(subject);
             const text = /^(?:Re:\s*)*New DM$/i.test(title.trim())
                 ? readLegacyBody(body) : `${title}\n\n${readLegacyBody(body)}`;
-            db.prepare('INSERT INTO thread_messages (threadID, accountID, content, timestamp, isSystem) VALUES (?, ?, ?, ?, 0)')
+            const result = db.prepare('INSERT INTO thread_messages (threadID, accountID, content, timestamp, isSystem) VALUES (?, ?, ?, ?, 0)')
                 .run(thread.threadID, sender, encode(text), now);
+            link(Number(result.lastInsertRowid), [legacyID]);
         } finally {
             translatingLegacy = false;
         }
@@ -53,7 +56,7 @@ module.exports = function install(api) {
         db.prepare('UPDATE thread_members SET status = 1, hidden = 0, joinedAt = CASE WHEN joinedAt = 0 THEN ? ELSE joinedAt END WHERE threadID = ?')
             .run(now, thread.threadID);
     }
-    function legacy(sender, name, recipient, subject, text, footer = '') {
+    function legacy(sender, name, recipient, subject, text, footer = '', messageID) {
         // A classic upload accepts at most 50 base64 characters in the subject.
         let title = '';
         for (const char of subject) {
@@ -75,12 +78,18 @@ module.exports = function install(api) {
             if (chunks[chunks.length - 1].length + suffix.length > 195) chunks.push(suffix.trimStart());
             else chunks[chunks.length - 1] += suffix;
         }
-        for (const part of chunks) db.prepare(`INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)`).run(encode(title), legacyBody(part), sender, name, recipient, Math.floor(Date.now() / 1000));
+        const ids = [];
+        for (const part of chunks) {
+            const result = db.prepare(`INSERT INTO messages (subject, body, accID, userName, toAccountID, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)`).run(encode(title), legacyBody(part), sender, name, recipient, Math.floor(Date.now() / 1000));
+            ids.push(Number(result.lastInsertRowid));
+        }
+        if (messageID) link(messageID, ids);
+        return ids;
     }
     const groups = require('./groupBridge')(db, legacy);
     const news = require('./newsBridge')(api, legacy);
-    function systemDM(accountID, text) {
+    function systemDM(accountID, text, legacyIDs = []) {
         let thread = db.prepare(`SELECT t.threadID FROM threads t JOIN thread_members m ON m.threadID = t.threadID
             WHERE t.isDM = 1 AND t.ownerID = 71 AND m.accountID = ?`).get(accountID);
         const now = Math.floor(Date.now() / 1000);
@@ -92,6 +101,7 @@ module.exports = function install(api) {
         }
         const result = db.prepare('INSERT INTO thread_messages (threadID, accountID, content, timestamp, isSystem) VALUES (?, 71, ?, ?, 0)')
             .run(thread.threadID, encode(text), now);
+        link(Number(result.lastInsertRowid), legacyIDs);
         db.prepare('UPDATE threads SET updatedAt = ?, mv = mv + 1 WHERE threadID = ?').run(now, thread.threadID);
         db.prepare('UPDATE thread_members SET hidden = 0 WHERE threadID = ? AND accountID = ?').run(thread.threadID, accountID);
         return `${thread.threadID}:${result.lastInsertRowid}`;
@@ -102,8 +112,8 @@ module.exports = function install(api) {
             const newsResponse = news.command(accountID, text);
             const response = newsResponse || groups.command(accountID, text);
             if (!response) return null;
-            legacy(SYSTEM_ID, SYSTEM_NAME, accountID, newsResponse ? 'News subscription' : 'Group command', response);
-            return systemDM(accountID, response);
+            const ids = legacy(SYSTEM_ID, SYSTEM_NAME, accountID, newsResponse ? 'News subscription' : 'Group command', response);
+            return systemDM(accountID, response, ids);
         })();
         return db.transaction(() => {
             const table = match[1].toLowerCase() === 'legacy_notif' ? 'legacy_compat_notifications' : 'legacy_compat_message_bridge';
@@ -111,8 +121,8 @@ module.exports = function install(api) {
                 ON CONFLICT(accountID) DO UPDATE SET enabled = excluded.enabled`).run(accountID, Number(match[2]));
             const label = table === 'legacy_compat_notifications' ? 'Legacy notifications' : 'Message bridge';
             const response = `${label} ${match[2] === '1' ? 'enabled' : 'disabled'}.`;
-            legacy(SYSTEM_ID, SYSTEM_NAME, accountID, 'Message bridge', response);
-            return systemDM(accountID, response);
+            const ids = legacy(SYSTEM_ID, SYSTEM_NAME, accountID, 'Message bridge', response);
+            return systemDM(accountID, response, ids);
         })();
     }
     api.registerHook('database:query', query => {
@@ -127,8 +137,8 @@ module.exports = function install(api) {
             const id = Number(query.params[0]);
             const account = db.prepare('SELECT userName FROM accounts WHERE accountID = ?').get(id);
             if (!account || /^_legacy_[a-f0-9]{24}$/.test(account.userName)) return query;
-            legacy(SYSTEM_ID, SYSTEM_NAME, id, 'Welcome to GDPSnode!', welcome);
-            systemDM(id, welcome);
+            const ids = legacy(SYSTEM_ID, SYSTEM_NAME, id, 'Welcome to GDPSnode!', welcome);
+            systemDM(id, welcome, ids);
         } else {
             const message = db.prepare('SELECT * FROM thread_messages WHERE messageID = ?').get(query.result.lastInsertRowid);
             if (message) groups.onMessage(message);
@@ -137,7 +147,7 @@ module.exports = function install(api) {
                 JOIN legacy_compat_message_bridge b ON b.accountID = m.accountID AND b.enabled = 1
                 WHERE t.threadID = ? AND t.isDM = 1 AND m.status IN (0, 1) AND m.accountID != ?`).all(message.threadID, message.accountID);
             const sender = db.prepare('SELECT userName FROM profiles WHERE accountID = ?').get(message.accountID);
-            for (const recipient of recipients) legacy(message.accountID, sender?.userName || 'Player', recipient.accountID, 'New DM', decode(message.content));
+            for (const recipient of recipients) legacy(message.accountID, sender?.userName || 'Player', recipient.accountID, 'New DM', decode(message.content), '', message.messageID);
         }
         return query;
     });
@@ -180,5 +190,5 @@ module.exports = function install(api) {
         if (thread && !db.prepare('SELECT 1 FROM thread_members WHERE threadID = ? AND accountID = ? AND status = 1').get(Number(body.threadID), Number(body.accountID))) return res.send('-1');
         return res.send(command(Number(body.accountID), decode(String(body.body || ''))) || '-1');
     });
-    return { command, readLegacyBody, forwardLegacy, notificationsEnabled, sendGroup: groups.sendLegacy };
+    return { command, readLegacyBody, forwardLegacy, notificationsEnabled, sendGroup: groups.sendLegacy, targetGroupCommand: groups.targetCommand, linkMessage: link };
 };
