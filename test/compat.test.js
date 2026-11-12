@@ -607,7 +607,7 @@ test('legacy compatibility against core endpoints and SQLite', async t => {
     });
     const rewardRequest = { gameVersion: '20', binaryVersion: '34', gdw: '0', accountID: '0', gjp: '',
         udid: 'ffffffff-bc90-02e8-0033-c5870033c587', uuid: '1', rewardType: '0', secret: 'Wmfd2893gb7', chk: 'ia5P8AwgACQA=' };
-    function rewardFields(wire, prefix = 'SaKuJ') {
+    function rewardFields(wire, prefix = 'eNDeR') {
         assert.ok(wire.startsWith(prefix));
         const [encoded, checksum] = wire.slice(5).split('|');
         assert.equal(checksum, crypto.createHash('sha1').update(encoded + 'pC26fpYaQCtg').digest('hex'));

@@ -10,5 +10,5 @@ module.exports = {
     "allow_unregistered_rates": true,
 
     "allow_message_bridge": true,
-    "allow_insecure_login": true,
+    "allow_insecure_login": false,
 };

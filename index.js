@@ -75,7 +75,7 @@ async function responseFor(text, state) {
         fields[1] = String(state.guestRewards.userID);
         fields[4] = '0';
         const payload = encode(xor(fields.join(':'), '59182'));
-        return `SaKuJ${payload}|${hash(payload + 'pC26fpYaQCtg')}`;
+        return `eNDeR${payload}|${hash(payload + 'pC26fpYaQCtg')}`;
     }
     if (target === '/getGJUserInfo20.php') {
         return pairs(text, ':', (key, value) => {
@@ -324,7 +324,7 @@ module.exports = {
                     // Classic frS=0 means allow all requests, including text. Core added
                     // a no-text setting at 0 and moved the old behavior to 2. Translate
                     // explicit settings updates only; do not change stored recipient policy.
-                    if (target === '/updateGJAccSettings20.php' && gameVersion < 22 && body.frS === '0') body.frS = '2';
+                    if (target === '/updateGJAccSettings20.php' && binaryVersion < 49 && body.frS === '0') body.frS = '2';
                     if (target === '/deleteGJAccComment20.php' && !body.targetAccountID) body.targetAccountID = body.accountID;
                     if (target === '/getGJUserInfo20.php' && body.accountID && body.accountID === body.targetAccountID && body.gjp2) {
                         const account = api.db.prepare('SELECT gjp2, isDisabled FROM accounts WHERE accountID = ?').get(body.accountID);
